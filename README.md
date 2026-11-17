@@ -306,6 +306,17 @@ npx tsc --noEmit       # 类型检查
 
 边画边判的效果可以用 `cdp.mjs` 的脚本量化：按住不放绕一个圆，在 25% / 50% / 75% / 100% 处读判读区。修之前各阶段读数是 `—`（从没推理过），修之后是 `11 / 9 / 8 / 9 ms`，排名一路在动——全程手指没松。
 
+顺手记一下工具本身，因为「怎么在 Windows 上看到 iPhone App 的真实界面」是个真问题：
+
+```bash
+npx expo start --web --port 8081          # 一个终端
+node tools/cdp/cdp.mjs '/play?mode=free' out.png tools/cdp/live.mjs
+```
+
+它用 Edge 的 `--remote-debugging-port` 开一个**真窗口**（不是 headless），所以既能 `Input.dispatchMouseEvent` 派发触摸、也能 `Page.captureScreenshot` 拿到真实像素。两条弯路先记在这里，省得再走：无头的 ego-browser 在这台机器上 `Page.captureScreenshot` 永远超时（进程离屏、合成器不出图），而 `msedge --headless=new --screenshot` 只截得到闪屏那一帧。
+
+web 预览有两个地方和 iOS 不一样，属于预期：顶部那个深色胶囊是 `NativeTabs` 的 web 实现（iOS 上是系统底部标签栏），`ContentUnavailableView`、`Gauge` 这类 SwiftUI 控件在 web 上走的是 RN 回退版本。
+
 ### 怎么证明它真的「边画边判」了
 
 拿最终 top-1 去衡量是没用的：那个数字是在**画完的图**上算的，模型完全可能画完 81%、半张图 30%，体感就是「一直不说话，松手才跳」。

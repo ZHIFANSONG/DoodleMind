@@ -13,6 +13,12 @@ concurrency:
   group: ios-${{ github.ref }}
   cancel-in-progress: true
 
+# 默认的 GITHUB_TOKEN 只有读权限，发布 Release 需要显式的 contents: write，
+# 否则最后一步报 "Resource not accessible by integration"（踩过一次：
+# 编译、校验、上传 artifact 全过，只在发 Release 时 403）。
+permissions:
+  contents: write
+
 jobs:
   ipa:
     runs-on: macos-15
