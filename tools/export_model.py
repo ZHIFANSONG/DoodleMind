@@ -89,6 +89,40 @@ def conv3x3_np(x: np.ndarray, w: np.ndarray, b: np.ndarray, relu: bool = True) -
     return out
 
 
+def reference_logits(
+    x: torch.Tensor,
+    weights: list[np.ndarray],
+    biases: list[np.ndarray],
+    head_w: np.ndarray,
+    head_b: np.ndarray,
+) -> torch.Tensor:
+    """用**解量化后的 int8 权重**重跑一遍前向，作为跨语言校验的参考。
+
+    为什么参考实现不能用训练时的原始 fp32 模型：
+    量化本身就会让 top-1 有 ~1% 的抖动（494/500 一致率就是这个数）。如果拿原始
+    fp32 当参考，Node 侧的校验就同时混进了「量化误差」和「实现 bug」两个变量，
+    阈值定多少都不对——定松了抓不到真 bug，定紧了永远红。
+
+    所以参考端也用解量化权重，这样两边跑的是**数学上同一个网络**，
+    剩下的任何不一致都只可能来自 TS 实现本身。
+    """
+    import torch.nn.functional as F  # noqa: N812
+
+    h = x
+    for bi, (w, b) in enumerate(zip(weights, biases)):
+        h = F.conv2d(
+            h,
+            torch.from_numpy(w),
+            torch.from_numpy(b),
+            padding=1,
+        )
+        h = F.relu(h)
+        if bi < len(weights) - 1:
+            h = F.max_pool2d(h, 2)
+    gap = h.mean(dim=(2, 3))
+    return gap @ torch.from_numpy(head_w).T + torch.from_numpy(head_b)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, default="doodlenet.pt")
@@ -171,7 +205,7 @@ def main() -> None:
         return (hw @ gap + hb).astype(np.float32)
 
     with torch.no_grad():
-        ref = model(torch.from_numpy(Xt).unsqueeze(1)).numpy()
+        ref = reference_logits(torch.from_numpy(Xt).unsqueeze(1), folded, biases, hw, hb).numpy()
     ref_pred = ref.argmax(axis=1)
     sub = np.arange(0, n_test, 3)  # 朴素 conv 慢，抽样 500 张
     agree = 0
@@ -179,18 +213,30 @@ def main() -> None:
         if int(np_forward(Xt[i]).argmax()) == int(ref_pred[i]):
             agree += 1
     print(
-        f"int8→fp32 与原始 fp32 的 top-1 一致率：{agree}/{len(sub)} = {agree / len(sub):.4f}",
+        f"朴素 numpy conv 与 torch(解量化权重) 的 top-1 一致率：{agree}/{len(sub)} = {agree / len(sub):.4f}",
         flush=True,
     )
-    print(f"原始 fp32 在这 {n_test} 张上 top1 = {(ref_pred == yt).mean():.4f}", flush=True)
+    print(f"量化后 top1（对照真值）在这 {n_test} 张上 = {(ref_pred == yt).mean():.4f}", flush=True)
+    with torch.no_grad():
+        raw = model(torch.from_numpy(Xt).unsqueeze(1)).numpy()
+    print(f"未量化 fp32 的 top1 = {(raw.argmax(axis=1) == yt).mean():.4f}", flush=True)
 
     # ---- 跨语言验证向量：给 Node 侧跑 TS 引擎对比 ----
+    # 除了 argmax，还导出**完整概率分布**。只比 argmax 是不够的：
+    # 当两个类别概率接近时（比如 0.31 vs 0.30），实现里一个微小的偏差就会翻转排名，
+    # 于是 96% 的一致率既可能是「哪都差一点点」，也可能是「某处真错了」。
+    # 直接比概率数值能把这两者分开——正确实现应该一致到 1e-4 量级。
     n_vec = 120
+    ref_probs = np.exp(ref[:n_vec] - ref[:n_vec].max(axis=1, keepdims=True))
+    ref_probs /= ref_probs.sum(axis=1, keepdims=True)
     vec = {
         "images": (Xall[:n_vec] * 255.0).round().astype(np.uint8).reshape(n_vec, -1).tolist(),
         "labels": yt[:n_vec].tolist(),
         "refPred": ref_pred[:n_vec].tolist(),
         "refTop5": [[int(v) for v in row] for row in np.argsort(-ref[:n_vec], axis=1)[:, :5].tolist()],
+        "refTop5Prob": [
+            [round(float(p), 6) for p in row] for row in np.sort(-ref_probs, axis=1)[:, :5] * -1
+        ],
     }
     (OUT / "test_vectors.json").write_text(json.dumps(vec), encoding="utf-8")
     print(f"验证向量 {OUT / 'test_vectors.json'}", flush=True)

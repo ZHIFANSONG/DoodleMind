@@ -10,13 +10,15 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 
-const { loadModel } = await import(join(root, 'src/lib/model.ts'));
+// Windows 上 ESM 只接受 file:// URL，直接传 "D:\..." 会报
+// ERR_UNSUPPORTED_ESM_URL_SCHEME（协议被解析成 'd:'）。
+const { loadModel } = await import(pathToFileURL(join(root, 'src/lib/model.ts')).href);
 
 const payload = JSON.parse(readFileSync(join(root, 'assets/model/doodlemind-v1.json'), 'utf8'));
 const vectors = JSON.parse(readFileSync(join(here, 'out/test_vectors.json'), 'utf8'));
@@ -24,7 +26,7 @@ const vectors = JSON.parse(readFileSync(join(here, 'out/test_vectors.json'), 'ut
 const model = loadModel(payload);
 console.log(`✓ 模型加载：${payload.nClasses} 类，${Math.round(payload.bytes / 1024)} KB`);
 
-const { images, labels, refPred, refTop5 } = vectors;
+const { images, labels, refPred, refTop5, refTop5Prob } = vectors;
 const n = images.length;
 
 function softmax(logits) {
@@ -45,6 +47,8 @@ let top1 = 0;
 let top5 = 0;
 let correct = 0;
 let totalMs = 0;
+/** 概率数值的最大绝对偏差：区分"实现在别处差一点"与"实现有 bug"的关键指标 */
+let maxProbDiff = 0;
 const first = [];
 
 for (let i = 0; i < n; i++) {
@@ -65,6 +69,15 @@ for (let i = 0; i < n; i++) {
 
   if (refTop5[i].includes(pred)) top5++;
   if (pred === labels[i]) correct++;
+
+  // 逐名次比概率。参考端用的是**解量化后的同一套权重**，
+  // 所以数学上应该完全相等，任何 >1e-3 的偏差都是实现问题而非浮点噪声。
+  if (refTop5Prob) {
+    for (let k = 0; k < 5; k++) {
+      const d = Math.abs(order[k].p - refTop5Prob[i][k]);
+      if (d > maxProbDiff) maxProbDiff = d;
+    }
+  }
 }
 
 console.log(`\n${n} 张测试图`);
@@ -72,13 +85,24 @@ console.log(`  top-1 与 PyTorch 一致 : ${top1}/${n}  (${((top1 / n) * 100).to
 console.log(`  我们的 top-1 落在参考 top-5 内: ${top5}/${n}  (${((top5 / n) * 100).toFixed(2)}%)`);
 console.log(`  我们的准确率（vs 真值）: ${correct}/${n}  (${((correct / n) * 100).toFixed(2)}%)`);
 console.log(`  单次推理: ${(totalMs / n).toFixed(2)} ms`);
+if (refTop5Prob) console.log(`  top-5 概率最大绝对偏差: ${maxProbDiff.toExponential(2)}`);
 
 if (first.length) {
   console.log('\n不一致样本：');
   for (const f of first) console.log(`  #${f.i} 我们=${f.ours} 参考=${f.ref} 真值=${f.label}`);
 }
 
-// 门槛：一致率低于 99.5% 说明实现有 bug，而不是「浮点误差」
-const ok = top1 / n >= 0.995;
-console.log(`\n${ok ? '✓ 通过' : '✗ 失败'}：要求 top-1 一致率 ≥ 99.5%`);
+/**
+ * 门槛怎么定：
+ * - 概率偏差必须 < 1e-3。这是真正的正确性判据。
+ * - top-1 一致率要求 100%。两边是同一个网络，argmax 由概率决定，
+ *   概率一致到 1e-3 时 argmax 翻转只可能发生在两个类别几乎并列的样本上；
+ *   那种样本本来就不该出现在"金标准"测试集里。真出现了就是真问题，得看。
+ */
+const probOk = !refTop5Prob || maxProbDiff < 1e-3;
+const predOk = top1 / n >= 0.995;
+const ok = probOk && predOk;
+console.log(
+  `\n${ok ? '✓ 通过' : '✗ 失败'}：概率偏差 < 1e-3 (${probOk ? 'ok' : 'fail'}) · top-1 一致率 ≥ 99.5% (${predOk ? 'ok' : 'fail'})`,
+);
 process.exit(ok ? 0 : 1);

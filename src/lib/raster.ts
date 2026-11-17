@@ -95,10 +95,14 @@ export function rasterizeInto(
     // 单点笔画退化成一个零长线段，保证能画出圆点
     const count = n === 1 ? 1 : n - 1;
     for (let i = 0; i < count; i++) {
-      const ax = xs[i] * scale + offX;
-      const ay = ys[i] * scale + offY;
-      const bx = n === 1 ? ax : xs[i + 1] * scale + offX;
-      const by = n === 1 ? ay : ys[i + 1] * scale + offY;
+      // 必须减掉包围盒原点再缩放。训练数据（QuickDraw simplified）已经对齐到
+      // 左上角最小值为 0，所以 Python 侧减去的是 0、看不出差别；但运行时的笔画
+      // 可能画在画布任何位置，不减原点会让内容整体平移出 32x32、被裁掉大半，
+      // 表现为「模型突然变笨」而没有任何报错。
+      const ax = (xs[i] - minX) * scale + offX;
+      const ay = (ys[i] - minY) * scale + offY;
+      const bx = n === 1 ? ax : (xs[i + 1] - minX) * scale + offX;
+      const by = n === 1 ? ay : (ys[i + 1] - minY) * scale + offY;
 
       const loX = Math.max(0, Math.floor(Math.min(ax, bx) - radius - 1));
       const hiX = Math.min(size - 1, Math.floor(Math.max(ax, bx) + radius + 1));

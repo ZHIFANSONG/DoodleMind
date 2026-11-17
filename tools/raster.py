@@ -66,7 +66,10 @@ def rasterize(
     def project(stroke):
         sx = stroke[0]
         sy = stroke[1]
-        return [(sx[i] * scale + off_x, sy[i] * scale + off_y) for i in range(len(sx))]
+        return [
+            ((sx[i] - min_x) * scale + off_x, (sy[i] - min_y) * scale + off_y)
+            for i in range(len(sx))
+        ]
 
     for stroke in strokes:
         pts = project(stroke)

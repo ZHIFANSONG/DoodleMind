@@ -53,3 +53,8 @@ __pycache__/
 # 模型二进制：用 tools/export_model.py 本地生成，不入库（体积大且可复现）
 assets/model/*.bin
 
+
+# 本地临时产物
+.expo-export-check/
+*.log
+

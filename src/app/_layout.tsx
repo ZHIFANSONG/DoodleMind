@@ -1,9 +1,8 @@
-import { DefaultTheme, ThemeProvider } from 'expo-router';
+import { DefaultTheme, Stack, ThemeProvider } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 
-import AppTabs from '@/components/app-tabs';
 import { SplashOverlay } from '@/components/splash-overlay';
-import { Palette } from '@/constants/design';
+import { Palette, Typography } from '@/constants/design';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -27,11 +26,38 @@ const paperTheme = {
   },
 };
 
+/**
+ * 根导航壳只有两层：三个常驻 tab（`(tabs)`）和一局游戏（`play`）。
+ *
+ * 为什么要把它们分层：游戏页要占满整屏、盖住 tab 栏，且它是个有时限的
+ * 「进行中的一局」，退出即作废——这是 Stack 推入的语义，不是 tab 切换的语义。
+ * 早先把 `play` 直接挂在 Tabs 下、用 `href: null` 摘出序列，看着能跑，
+ * 但 web 上 URL 直达会静默退回首页（tab 容器里没有可激活的子路由）。
+ */
 export default function RootLayout() {
   return (
     <ThemeProvider value={paperTheme}>
       <SplashOverlay />
-      <AppTabs />
+      <Stack
+        screenOptions={{
+          contentStyle: { backgroundColor: Palette.paper },
+          headerStyle: { backgroundColor: Palette.paper },
+          headerShadowVisible: false,
+          headerTintColor: Palette.seal,
+          headerTitleStyle: {
+            color: Palette.ink,
+            fontFamily: Typography.zh,
+            fontSize: 16,
+            fontWeight: '600',
+          },
+          headerBackTitle: '回去',
+        }}>
+        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        <Stack.Screen
+          name="play"
+          options={{ animation: 'slide_from_bottom', gestureEnabled: true }}
+        />
+      </Stack>
     </ThemeProvider>
   );
 }

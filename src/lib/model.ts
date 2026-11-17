@@ -159,11 +159,17 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
         for (let kx = 0; kx < 3; kx++) {
           const din = ky - 1;
           const dkx = kx - 1;
-          // 有效输出区间：y 在 [max(0,-din), min(h, h-din))
+          // 输出 (y,x) 读输入 (y+din, x+dkx)。有效条件是 0 <= y+din <= h-1，
+          // 即 y ∈ [max(0,-din), min(h, h-din))。
+          //
+          // 这里极易写反：din>0（向下偏移）时上界是 h-din，din<0 才是 h。
+          // 写反的后果不是崩溃，而是读到相邻通道的内存——数组本身不会越界
+          // （后面还有别的通道），模型照样出结果，只是悄悄变笨。
+          // 当年就是靠跨语言一致率从 100% 掉到 57% 才把它抓出来。
           const y0 = din < 0 ? -din : 0;
-          const y1 = din > 0 ? h : h + din;
+          const y1 = din > 0 ? h - din : h;
           const x0 = dkx < 0 ? -dkx : 0;
-          const x1 = dkx > 0 ? wd : wd + dkx;
+          const x1 = dkx > 0 ? wd - dkx : wd;
           if (y1 <= y0 || x1 <= x0) continue;
           for (let co = 0; co < cout; co++) {
             const k = w[(co * cin + ci) * 9 + ky * 3 + kx];

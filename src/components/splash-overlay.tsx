@@ -8,13 +8,17 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Animated, Easing, StyleSheet } from 'react-native';
+import { Animated, Easing, Platform, StyleSheet } from 'react-native';
 import * as SplashScreen from 'expo-splash-screen';
 
 import { Palette, Typography } from '@/constants/design';
 
+// web 上没有系统闪屏，这一层纯属多余：它只会让每次刷新都白等一秒，
+// 而 web 端唯一的用途是本地预览 UI，任何多余等待都是干扰。直接不进这个分支。
+const ENABLED = Platform.OS !== 'web';
+
 export function SplashOverlay() {
-  const [visible, setVisible] = useState(true);
+  const [visible, setVisible] = useState(ENABLED);
   // 用 useState 的惰性初始化持有 Animated.Value：它一旦创建就不该被替换，
   // 用 useRef 存会在渲染里读 ref.current，React 的 lint 会（正确地）报错。
   const [ink] = useState(() => new Animated.Value(0));
@@ -23,6 +27,7 @@ export function SplashOverlay() {
   useEffect(() => {
     // 先让系统闪屏退场，再播我们自己的过渡，避免两层叠在一起
     SplashScreen.hideAsync().catch(() => {});
+    if (!ENABLED) return;
     Animated.sequence([
       Animated.timing(ink, {
         toValue: 1,

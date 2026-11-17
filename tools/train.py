@@ -119,20 +119,31 @@ def load_data(per_class: int, seed: int):
     return X[n_val:], y[n_val:], X[:n_val], y[:n_val], words
 
 
-def evaluate(model: nn.Module, X: np.ndarray, y: np.ndarray, bs: int = 512):
+def evaluate(model: nn.Module, X: np.ndarray, y: np.ndarray, dev: torch.device, bs: int = 512):
     model.eval()
     top1 = top5 = 0
     with torch.no_grad():
         for i in range(0, len(X), bs):
-            xb = torch.from_numpy(X[i : i + bs]).unsqueeze(1)
+            xb = torch.from_numpy(X[i : i + bs]).unsqueeze(1).to(dev)
             logits = model(xb)
-            yb = torch.from_numpy(y[i : i + bs])
+            yb = torch.from_numpy(y[i : i + bs]).to(dev)
             k = min(5, logits.shape[1])
             _, pred = logits.topk(k, dim=1)
             top1 += (pred[:, 0] == yb).sum().item()
             top5 += (pred == yb[:, None]).any(dim=1).sum().item()
     n = len(X)
     return top1 / n, top5 / n
+
+
+def resolve_device(choice: str) -> torch.device:
+    """auto 走 CUDA，但要有兜底：CUDA 版 torch 装上了、驱动却认不出卡的情况常见。"""
+    if choice == "cpu":
+        return torch.device("cpu")
+    if choice == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("指定了 --device cuda，但 torch.cuda.is_available() 为 False")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def main() -> None:
@@ -144,7 +155,13 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=20261117)
     ap.add_argument("--width", type=str, default="24,48,96,128")
     ap.add_argument("--out", type=str, default="doodlenet.pt")
+    # 默认 auto：有 CUDA 就用 CUDA。这个网很小，GPU 的瓶颈其实在数据搬运上，
+    # 所以 --device cuda 时要开 pin_memory + 非阻塞拷贝，否则提升有限。
+    ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     args = ap.parse_args()
+
+    dev = resolve_device(args.device)
+    print(f"设备 {dev}" + (f"  ({torch.cuda.get_device_name(0)})" if dev.type == "cuda" else ""), flush=True)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -153,7 +170,7 @@ def main() -> None:
     Xtr, ytr, Xva, yva, words = load_data(args.per_class, args.seed)
     print(f"训练 {Xtr.shape[0]} / 验证 {Xva.shape[0]}", flush=True)
 
-    model = DoodleNet(len(words), width=width)
+    model = DoodleNet(len(words), width=width).to(dev)
     nparam = sum(p.numel() for p in model.parameters())
     print(f"参数量 {nparam:,}  (conv 部分 int8 ≈ {(nparam - model.head.weight.numel() - model.head.bias.numel()) / 1024:.0f} KB)", flush=True)
 
@@ -177,8 +194,8 @@ def main() -> None:
         for i in range(0, len(perm), args.batch):
             idx = perm[i : i + args.batch]
             xb = torch.from_numpy(Xtr[idx]).unsqueeze(1)
-            xb = augment(xb, rng)
-            yb = torch.from_numpy(ytr[idx])
+            xb = augment(xb, rng).to(dev, non_blocking=True)
+            yb = torch.from_numpy(ytr[idx]).to(dev, non_blocking=True)
             if rng.random() < 0.3:  # mixup：抑制过自信，量化后更稳
                 lam = float(rng.beta(0.35, 0.35))
                 pi = torch.randperm(xb.shape[0])
@@ -195,13 +212,19 @@ def main() -> None:
             run_loss += loss.item() * len(idx)
             seen += len(idx)
         t1 = time.time()
-        t1_acc, t5_acc = evaluate(model, Xva, yva)
+        t1_acc, t5_acc = evaluate(model, Xva, yva, dev)
         hist.append({"epoch": ep + 1, "loss": round(run_loss / seen, 4), "top1": round(t1_acc, 4), "top5": round(t5_acc, 4)})
         star = ""
         if t1_acc > best:
             best = t1_acc
             torch.save(
-                {"state": model.state_dict(), "width": list(width), "words": [str(w) for w in words]},
+                {
+                    # 权重存 CPU 副本：导出脚本在纯 CPU 上跑，
+                    # 存 CUDA 张量会让它必须记得传 map_location，漏一次就炸。
+                    "state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    "width": list(width),
+                    "words": [str(w) for w in words],
+                },
                 OUT / args.out,
             )
             star = "  *"

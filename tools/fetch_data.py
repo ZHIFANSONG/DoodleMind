@@ -62,8 +62,8 @@ def rasterize_np(strokes: list[list[list[float]]], size: int = SIZE, pad: float 
     for s in strokes:
         if len(s) < 2 or len(s[0]) < 1:
             continue
-        sx = np.asarray(s[0], dtype=np.float64) * scale + off_x
-        sy = np.asarray(s[1], dtype=np.float64) * scale + off_y
+        sx = (np.asarray(s[0], dtype=np.float64) - min_x) * scale + off_x
+        sy = (np.asarray(s[1], dtype=np.float64) - min_y) * scale + off_y
         if len(sx) == 1:
             sx = np.array([sx[0], sx[0]], dtype=np.float64)
             sy = np.array([sy[0], sy[0]], dtype=np.float64)
