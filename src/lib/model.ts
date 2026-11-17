@@ -1,16 +1,27 @@
 /**
  * 端上 CNN 推理引擎。纯 TypeScript，无任何原生依赖、无 tfjs。
  *
- * 网络结构（与 `tools/train.py::DoodleNet` 严格一致）：
+ * 网络结构由模型文件里的 op 序列决定（v4 格式），支持三种算子混搭：
+ *   dense3x3 / depthwise3x3 / pointwise1x1 —— 后两者组合起来就是可分离卷积。
+ * 训练侧 `tools/train.py --arch sep` 产出的结构：
  *   输入 1x32x32
- *   block1: conv3x3(1→24)  + ReLU   @32, maxpool→16
- *   block2: conv3x3(24→48) + ReLU   @16, maxpool→8
- *   block3: conv3x3(48→96) + ReLU   @8,  maxpool→4
- *   block4: conv3x3(96→128)+ ReLU   @4
- *   GAP → FC(128→N) → softmax
+ *   dense3x3(1→48)  +ReLU  @32 →pool→16
+ *   depthwise(48)   +ReLU  @16
+ *   pointwise(48→160)+ReLU @16 →pool→8
+ *   depthwise(160)  +ReLU  @8
+ *   pointwise(160→320)+ReLU@8  →pool→4
+ *   depthwise(320)  +ReLU  @4
+ *   pointwise(320→512)+ReLU@4
+ *   GAP → FC(512→N) → softmax
  *
- * 权重以 per-output-channel 对称 int8 存储，首次加载时一次性解量化成
- * Float32Array 常驻内存（约 650KB）。推理全程 float32 —— JS 里没有 SIMD，
+ * 为什么值得多写两种算子：端上引擎是纯 JS，没有 SIMD，实测有效算力约
+ * 1.0~1.2 GMAC/s，而这张网每帧都要跑一次（玩家边画边判）。也就是说
+ * **模型的强度上限被 MAC 数锁死**。可分离卷积把每个 MAC 的价值提到 7 倍
+ * （实测 6.92x，几乎吃满理论值），省下的算力全部还给通道数——
+ * 这是在不牺牲手感的前提下把模型做强的唯一途径。
+ *
+ * 权重以 per-channel 对称 int8 存储，首次加载时一次性解量化成
+ * Float32Array 常驻内存。推理全程 float32 —— JS 里没有 SIMD，
  * 整数运算并不比浮点快，而激活量化会累积误差，不划算。
  *
  * 为什么不用 tfjs：tfjs 的 wasm 后端在 Expo Go 里跑不了（要 WASM 支持），
@@ -27,10 +38,20 @@ export type DoodleModel = {
   topK(img: Uint8Array, size: number, k: number): { index: number; p: number }[];
 };
 
+type OpType = 0 | 1 | 2; // 0=dense3x3  1=depthwise3x3  2=pointwise1x1
+
 type Layer = {
+  type: OpType;
   cin: number;
   cout: number;
-  /** (cout * cin * 9) 解量化后的 float32，行主序 [co][ci][ky][kx] */
+  /** 该层之后是否接 2x2 maxpool */
+  pool: boolean;
+  /**
+   * 解量化后的 float32 权重，行主序。元素个数由 type 决定：
+   *   dense3x3    cout*cin*9   [co][ci][ky][kx]
+   *   depthwise   cin*9        [ci][ky][kx]（每通道独享一组 3x3）
+   *   pointwise   cout*cin     [co][ci]
+   */
   w: Float32Array;
   bias: Float32Array;
 };
@@ -73,7 +94,10 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
   if (magic !== MAGIC) throw new Error(`模型文件 magic 不对: 0x${magic.toString(16)}`);
   p = 4;
   const version = view.getUint8(p++);
-  if (version !== 2) throw new Error(`模型版本 ${version} 不支持（期望 2）`);
+  // v2：分类头是 f32；v3：分类头也做了 per-class int8 量化；
+  // v4：每个 op 前带类型字节（dense/dw/pw），支持可分离卷积结构。
+  // 全部认，免得旧权重文件因为格式升级当场报废。
+  if (version < 2 || version > 4) throw new Error(`模型版本 ${version} 不支持（期望 2~4）`);
   const nClasses = view.getUint16(p, true);
   p += 2;
   const nBlocks = view.getUint16(p, true);
@@ -84,6 +108,14 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
 
   const layers: Layer[] = [];
   for (let bi = 0; bi < nBlocks; bi++) {
+    // v4 才带 type/flags；旧格式一律视作 dense3x3、前 3 层池化。
+    let type: OpType = 0;
+    let pool = bi < nBlocks - 1;
+    if (version >= 4) {
+      type = view.getUint8(p++) as OpType;
+      const flags = view.getUint8(p++);
+      pool = (flags & 1) === 1;
+    }
     const cin = view.getUint16(p, true);
     p += 2;
     const cout = view.getUint16(p, true);
@@ -100,28 +132,56 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
       p += 4;
     }
 
-    const n = cout * cin * 9;
+    // 权重个数按算子类型算。这三条公式必须和 tools/export_model.py::weight_count 一致，
+    // 差一个数就会读到下一层的字节，不报错，只是模型悄悄变笨。
+    const n = type === 0 ? cout * cin * 9 : type === 1 ? cin * 9 : cout * cin;
     const w = new Float32Array(n);
-    // 解量化：q * wScale[co]
     let q = p;
     let oi = 0;
-    for (let co = 0; co < cout; co++) {
-      const s = wScale[co];
-      for (let t = 0; t < cin * 9; t++) {
-        w[oi++] = view.getInt8(q) * s;
-        q += 1;
+    if (type === 0 || type === 2) {
+      // 两种都是 per-cout 的 scale：dense 每组 cin*9 个，pointwise 每组 cin 个
+      const per = type === 0 ? cin * 9 : cin;
+      for (let co = 0; co < cout; co++) {
+        const s = wScale[co];
+        for (let t = 0; t < per; t++) w[oi++] = view.getInt8(q++) * s;
+      }
+    } else {
+      // depthwise 每组只有 9 个权重，但「组」是输入通道，scale 也是按输入通道给的
+      for (let ci = 0; ci < cin; ci++) {
+        const s = wScale[ci];
+        for (let t = 0; t < 9; t++) w[oi++] = view.getInt8(q++) * s;
       }
     }
     p += n;
-    layers.push({ cin, cout, w, bias });
+    layers.push({ type, cin, cout, pool, w, bias });
   }
 
   const width = view.getUint16(p, true);
   p += 2;
   const headW = new Float32Array(nClasses * width);
-  for (let i = 0; i < headW.length; i++) {
-    headW[i] = view.getFloat32(p, true);
-    p += 4;
+  if (version >= 3) {
+    // v3：每类一组 scale，权重是 int8。解量化回 f32 再算，
+    // 因为激活本来就是 f32，点积保持同一量纲最省心（head 只有 19k 次乘加）。
+    const headScale = new Float32Array(nClasses);
+    for (let i = 0; i < nClasses; i++) {
+      headScale[i] = view.getFloat32(p, true);
+      p += 4;
+    }
+    let q = p;
+    let oi = 0;
+    for (let k = 0; k < nClasses; k++) {
+      const s = headScale[k];
+      for (let i = 0; i < width; i++) {
+        headW[oi++] = view.getInt8(q) * s;
+        q += 1;
+      }
+    }
+    p += nClasses * width;
+  } else {
+    for (let i = 0; i < headW.length; i++) {
+      headW[i] = view.getFloat32(p, true);
+      p += 4;
+    }
   }
   const headB = new Float32Array(nClasses);
   for (let i = 0; i < nClasses; i++) {
@@ -129,13 +189,32 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
     p += 4;
   }
 
-  // 复用的中间缓冲。最大尺寸 = 第一层 32x32x24，之后越来越小，
-  // 统一按 32*32*maxCout 分配一次，避免每帧 GC。
-  const maxCout = Math.max(...layers.map((l) => l.cout));
-  let bufA = new Float32Array(32 * 32 * maxCout);
-  let bufB = new Float32Array(32 * 32 * maxCout);
+  // 复用的中间缓冲。尺寸必须盖住**每一层**的通道数 × 面积，
+  // 不能只看 cout：depthwise 的输出通道数等于 cin，而它出现在面积更大的层上。
+  // 分配一次常驻，避免每帧 GC。
+  let maxCells = 0;
+  {
+    let hh = 32;
+    for (const l of layers) {
+      const cells = Math.max(l.cin, l.cout) * hh * hh;
+      if (cells > maxCells) maxCells = cells;
+      if (l.pool) hh >>= 1;
+    }
+  }
+  let bufA = new Float32Array(maxCells);
+  let bufB = new Float32Array(maxCells);
 
-  /** 3x3 pad=1 conv + ReLU。in: (cin,h,w) 行主序 */
+  /**
+   * 3x3 pad=1 conv + ReLU。in: (cin,h,w) 行主序。
+   *
+   * 循环顺序是**输出通道在外、输入通道在内**，这跟直觉相反但很要紧：
+   * 反过来的话（输入通道在外、输出通道在内）每算一个 tap 就要把所有 cout 个
+   * 输出平面各摸一次，32x32x128 的输出是 512KB，远超 L2，等于每次都在内存里
+   * 来回跳。改成通道在外之后，累加只落在一个 4KB 的平面上，全程留在缓存里。
+   *
+   * 另外把内部区域和边缘拆开：边缘要判越界，内部不用。32x32 里九成以上是内部。
+   * 推理是**每一帧都要跑一次**的路径（玩家边画边判），这里省下的每一毫秒都算数。
+   */
   function conv3x3(
     input: Float32Array,
     layer: Layer,
@@ -145,43 +224,70 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
   ): void {
     const { cin, cout, w, bias } = layer;
     const area = h * wd;
-    out.fill(0, 0, cout * area);
-    // 先把 bias 铺进去
-    for (let co = 0; co < cout; co++) {
-      const b = bias[co];
-      const base = co * area;
-      out.fill(b, base, base + area);
-    }
+    const yEnd = h - 1;
+    const xEnd = wd - 1;
 
-    for (let ci = 0; ci < cin; ci++) {
-      const inBase = ci * area;
-      for (let ky = 0; ky < 3; ky++) {
-        for (let kx = 0; kx < 3; kx++) {
-          const din = ky - 1;
-          const dkx = kx - 1;
-          // 输出 (y,x) 读输入 (y+din, x+dkx)。有效条件是 0 <= y+din <= h-1，
-          // 即 y ∈ [max(0,-din), min(h, h-din))。
-          //
-          // 这里极易写反：din>0（向下偏移）时上界是 h-din，din<0 才是 h。
-          // 写反的后果不是崩溃，而是读到相邻通道的内存——数组本身不会越界
-          // （后面还有别的通道），模型照样出结果，只是悄悄变笨。
-          // 当年就是靠跨语言一致率从 100% 掉到 57% 才把它抓出来。
-          const y0 = din < 0 ? -din : 0;
-          const y1 = din > 0 ? h - din : h;
-          const x0 = dkx < 0 ? -dkx : 0;
-          const x1 = dkx > 0 ? wd - dkx : wd;
-          if (y1 <= y0 || x1 <= x0) continue;
-          for (let co = 0; co < cout; co++) {
-            const k = w[(co * cin + ci) * 9 + ky * 3 + kx];
-            if (k === 0) continue;
-            const outBase = co * area;
-            for (let y = y0; y < y1; y++) {
-              const inRow = inBase + (y + din) * wd;
-              const outRow = outBase + y * wd;
-              for (let x = x0; x < x1; x++) {
-                out[outRow + x] += k * input[inRow + x + dkx];
+    for (let co = 0; co < cout; co++) {
+      const ob = co * area;
+      const b = bias[co];
+      out.fill(b, ob, ob + area);
+
+      for (let ci = 0; ci < cin; ci++) {
+        const ib = ci * area;
+        const kw = (co * cin + ci) * 9;
+        const k00 = w[kw];
+        const k01 = w[kw + 1];
+        const k02 = w[kw + 2];
+        const k10 = w[kw + 3];
+        const k11 = w[kw + 4];
+        const k12 = w[kw + 5];
+        const k20 = w[kw + 6];
+        const k21 = w[kw + 7];
+        const k22 = w[kw + 8];
+        // int8 量化后整组为 0 的通道不罕见（死通道），跳过省一整趟
+        if (k00 === 0 && k01 === 0 && k02 === 0 && k10 === 0 && k11 === 0 && k12 === 0 && k20 === 0 && k21 === 0 && k22 === 0) {
+          continue;
+        }
+
+        // ── 内部区域：不需要判越界，九成以上的乘加都在这儿 ──
+        for (let y = 1; y < yEnd; y++) {
+          const mid = ib + y * wd;
+          const oRow = ob + y * wd;
+          for (let x = 1; x < xEnd; x++) {
+            const c = mid + x;
+            out[oRow + x] +=
+              k00 * input[c - wd - 1] + k01 * input[c - wd] + k02 * input[c - wd + 1] +
+              k10 * input[c - 1] + k11 * input[c] + k12 * input[c + 1] +
+              k20 * input[c + wd - 1] + k21 * input[c + wd] + k22 * input[c + wd + 1];
+          }
+        }
+      }
+    }
+    // ── 边界那一圈（第一/最后一行 + 第一/最后一列，共 4h-4 个像素）──
+    // 一律走最朴素的判越界通式，**不给任何一条边写特例**。
+    // 我先试过为左右端点手写展开（省几十次循环判断），结果左端点漏掉了
+    // kx=-1 越界的那三个 tap，top-1 一致率立刻从 100% 掉到 97.5%——
+    // 而这种错不会崩、不会报错，只会让模型"有点笨"。为几十个像素担这个风险不值得。
+    for (let co = 0; co < cout; co++) {
+      const ob = co * area;
+      for (let ci = 0; ci < cin; ci++) {
+        const ib = ci * area;
+        const kw = (co * cin + ci) * 9;
+        for (let y = 0; y < h; y++) {
+          const edgeRow = y === 0 || y === yEnd;
+          for (let x = 0; x < wd; x++) {
+            if (!edgeRow && x !== 0 && x !== xEnd) continue;
+            let acc = 0;
+            for (let ky = 0; ky < 3; ky++) {
+              const sy = y + ky - 1;
+              if (sy < 0 || sy >= h) continue;
+              for (let kx = 0; kx < 3; kx++) {
+                const sx = x + kx - 1;
+                if (sx < 0 || sx >= wd) continue;
+                acc += w[kw + ky * 3 + kx] * input[ib + sy * wd + sx];
               }
             }
+            out[ob + y * wd + x] += acc;
           }
         }
       }
@@ -191,6 +297,151 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
     const total = cout * area;
     for (let i = 0; i < total; i++) {
       if (out[i] < 0) out[i] = 0;
+    }
+  }
+
+  /**
+   * depthwise 3x3 pad=1 + ReLU。每通道独享一组 3x3，不做通道混合。
+   *
+   * 和 dense 版相比它省掉了 cin 这层循环：dense 的 MAC 是 cout*cin*9*area，
+   * 这里只有 cin*9*area。代价是通道之间不再交互，必须靠紧跟的 pointwise 补回来。
+   * 内部/边界照样拆开——同一套理由，别为几十个像素写特例。
+   */
+  function conv3x3dw(
+    input: Float32Array,
+    layer: Layer,
+    h: number,
+    wd: number,
+    out: Float32Array,
+  ): void {
+    const { cin, w, bias } = layer;
+    const area = h * wd;
+    const yEnd = h - 1;
+    const xEnd = wd - 1;
+
+    for (let ci = 0; ci < cin; ci++) {
+      const base = ci * area;
+      const b = bias[ci];
+      out.fill(b, base, base + area);
+      const kw = ci * 9;
+      const k00 = w[kw];
+      const k01 = w[kw + 1];
+      const k02 = w[kw + 2];
+      const k10 = w[kw + 3];
+      const k11 = w[kw + 4];
+      const k12 = w[kw + 5];
+      const k20 = w[kw + 6];
+      const k21 = w[kw + 7];
+      const k22 = w[kw + 8];
+      // 整组为零的通道直接跳过：量化后这种通道不罕见
+      if (k00 === 0 && k01 === 0 && k02 === 0 && k10 === 0 && k11 === 0 && k12 === 0 && k20 === 0 && k21 === 0 && k22 === 0) {
+        continue;
+      }
+
+      for (let y = 1; y < yEnd; y++) {
+        const mid = base + y * wd;
+        const oRow = mid;
+        for (let x = 1; x < xEnd; x++) {
+          const c = mid + x;
+          out[oRow + x] +=
+            k00 * input[c - wd - 1] + k01 * input[c - wd] + k02 * input[c - wd + 1] +
+            k10 * input[c - 1] + k11 * input[c] + k12 * input[c + 1] +
+            k20 * input[c + wd - 1] + k21 * input[c + wd] + k22 * input[c + wd + 1];
+        }
+      }
+
+      // 边界一圈：判越界通式
+      for (let y = 0; y < h; y++) {
+        const edgeRow = y === 0 || y === yEnd;
+        for (let x = 0; x < wd; x++) {
+          if (!edgeRow && x !== 0 && x !== xEnd) continue;
+          let acc = 0;
+          for (let ky = 0; ky < 3; ky++) {
+            const sy = y + ky - 1;
+            if (sy < 0 || sy >= h) continue;
+            for (let kx = 0; kx < 3; kx++) {
+              const sx = x + kx - 1;
+              if (sx < 0 || sx >= wd) continue;
+              acc += w[kw + ky * 3 + kx] * input[base + sy * wd + sx];
+            }
+          }
+          out[base + y * wd + x] += acc;
+        }
+      }
+    }
+
+    const total = cin * area;
+    for (let i = 0; i < total; i++) {
+      if (out[i] < 0) out[i] = 0;
+    }
+  }
+
+  /**
+   * pointwise 1x1 + ReLU：纯通道混合，每个输出像素是 cin 个数的点积。
+   *
+   * 内层只有一次乘加，循环开销占比高（实测比 dense 的「有效算力」略低），
+   * 所以**一次算 4 个输出通道**：读一个 input 值摊到 4 次乘加上，
+   * 把下标运算和循环判断摊薄。实测这一手在 16x16 上值 4~5 成。
+   */
+  function conv1x1(
+    input: Float32Array,
+    layer: Layer,
+    area: number,
+    out: Float32Array,
+  ): void {
+    const { cin, cout, w, bias } = layer;
+    const G = 4;
+
+    for (let co0 = 0; co0 < cout; co0 += G) {
+      const n = cout - co0 < G ? cout - co0 : G;
+      const b0 = bias[co0];
+      const o0 = co0 * area;
+      const o1 = o0 + area;
+      const o2 = o1 + area;
+      const o3 = o2 + area;
+      out.fill(b0, o0, o0 + area);
+      if (n > 1) out.fill(bias[co0 + 1], o1, o1 + area);
+      if (n > 2) out.fill(bias[co0 + 2], o2, o2 + area);
+      if (n > 3) out.fill(bias[co0 + 3], o3, o3 + area);
+
+      if (n === 4) {
+        for (let ci = 0; ci < cin; ci++) {
+          const ib = ci * area;
+          const wb = (co0 * cin) + ci;
+          const q0 = w[wb];
+          const q1 = w[wb + cin];
+          const q2 = w[wb + 2 * cin];
+          const q3 = w[wb + 3 * cin];
+          for (let i = 0; i < area; i++) {
+            const v = input[ib + i];
+            out[o0 + i] += q0 * v;
+            out[o1 + i] += q1 * v;
+            out[o2 + i] += q2 * v;
+            out[o3 + i] += q3 * v;
+          }
+        }
+      } else {
+        for (let ci = 0; ci < cin; ci++) {
+          const ib = ci * area;
+          const wb = (co0 * cin) + ci;
+          const q0 = w[wb];
+          for (let i = 0; i < area; i++) out[o0 + i] += q0 * input[ib + i];
+          if (n > 1) {
+            const q1 = w[wb + cin];
+            for (let i = 0; i < area; i++) out[o1 + i] += q1 * input[ib + i];
+          }
+          if (n > 2) {
+            const q2 = w[wb + 2 * cin];
+            for (let i = 0; i < area; i++) out[o2 + i] += q2 * input[ib + i];
+          }
+        }
+      }
+
+      // ReLU 逐组做，避免再扫一遍整个输出
+      const lim = (co0 + n) * area;
+      for (let i = o0; i < lim; i++) {
+        if (out[i] < 0) out[i] = 0;
+      }
     }
   }
 
@@ -236,10 +487,13 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
     for (let bi = 0; bi < layers.length; bi++) {
       const layer = layers[bi];
       const dst = cur === bufA ? bufB : bufA;
-      conv3x3(cur, layer, h, wd, dst);
+      // 按算子类型分派。type 与 tools/export_model.py 的 T_* 常量一一对应。
+      if (layer.type === 0) conv3x3(cur, layer, h, wd, dst);
+      else if (layer.type === 1) conv3x3dw(cur, layer, h, wd, dst);
+      else conv1x1(cur, layer, h * wd, dst);
       cur = dst;
       c = layer.cout;
-      if (bi < layers.length - 1) {
+      if (layer.pool) {
         const pooled = cur === bufA ? bufB : bufA;
         const [oh, ow] = maxpool2(cur, c, h, wd, pooled);
         cur = pooled;

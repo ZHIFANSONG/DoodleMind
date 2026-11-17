@@ -16,12 +16,45 @@ import { dirname, join } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 
+/**
+ * 默认校验**App 实际加载的那个模型**：从 `src/hooks/use-doodle-ai.ts` 里读出
+ * `require('../../assets/model/xxx.json')` 的文件名。
+ *
+ * 为什么不写死常量：写死就意味着换模型时必须记得改两个地方，而「忘了改闸门」的后果
+ * 不是报错，是 CI 兴高采烈地校验一个早就不用了的旧模型、然后放行一个没验过的新模型。
+ * 说明文字会过期，静态 require 的字符串不会。
+ *
+ * 也可显式指定：`node tools/check-engine.mjs doodlemind-v4`
+ */
+function resolveModelName() {
+  if (process.argv[2]) return process.argv[2];
+  const hook = readFileSync(join(root, 'src/hooks/use-doodle-ai.ts'), 'utf8');
+  const hit = hook.match(/assets\/model\/([\w.-]+)\.json/);
+  if (!hit) throw new Error('没能从 src/hooks/use-doodle-ai.ts 里找到 assets/model/*.json 引用');
+  return hit[1];
+}
+
+const MODEL = resolveModelName();
+console.log(`校验模型：${MODEL}`);
+
 // Windows 上 ESM 只接受 file:// URL，直接传 "D:\..." 会报
 // ERR_UNSUPPORTED_ESM_URL_SCHEME（协议被解析成 'd:'）。
 const { loadModel } = await import(pathToFileURL(join(root, 'src/lib/model.ts')).href);
 
-const payload = JSON.parse(readFileSync(join(root, 'assets/model/doodlemind-v1.json'), 'utf8'));
-const vectors = JSON.parse(readFileSync(join(here, 'out/test_vectors.json'), 'utf8'));
+const payload = JSON.parse(readFileSync(join(root, `assets/model/${MODEL}.json`), 'utf8'));
+
+// 参考向量必须与模型**同名同源**：里面的 refPred / refTop5Prob 是用这一个模型的
+// 解量化权重算出来的。拿 A 模型的参考去校验 B 模型，一致率会掉到 70%，而这个数字
+// 看起来像「引擎写错了」，实际是「拿错了标尺」。所以缺了就直说缺，不去猜。
+const vecPath = join(here, `vectors/test_vectors_${MODEL}.json`);
+let vectors;
+try {
+  vectors = JSON.parse(readFileSync(vecPath, 'utf8'));
+} catch {
+  console.error(`缺少参考向量：${vecPath}`);
+  console.error(`请先跑 python tools/export_model.py --ckpt <权重> --name ${MODEL}（导出时会一并生成）`);
+  process.exit(1);
+}
 
 const model = loadModel(payload);
 console.log(`✓ 模型加载：${payload.nClasses} 类，${Math.round(payload.bytes / 1024)} KB`);

@@ -21,7 +21,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from raster import SIZE, rasterize_u8  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "tools" / "out" / "raster_vectors.json"
+# 必须入库：CI 上要跑 check-raster.mjs，没有 Python 环境。
+OUT = ROOT / "tools" / "vectors" / "raster_vectors.json"
 N = 40
 
 

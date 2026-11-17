@@ -88,6 +88,14 @@ export default function PlayScreen() {
   const [snap, setSnap] = useState<Snapshot>(() => session.snapshot(Date.now()));
   const [inferMs, setInferMs] = useState(0);
   const [ink, setInk] = useState(0);
+  /**
+   * 已经落进画面的笔数（含**正在画的那一笔**）。
+   *
+   * 不能用 `strokes.length`：抬手才 setStrokes，所以整条笔画的过程中它一直不变，
+   * 判读区会一直显示「还没落笔，它只能瞎猜」——明明手指已经在画了。
+   * 这个值在 applyResult 里跟着推理一起更新（节流后的），频率天然受控。
+   */
+  const [liveCount, setLiveCount] = useState(0);
   const [result, setResult] = useState<RoundResult | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [board, setBoard] = useState(0);
@@ -198,6 +206,7 @@ export default function PlayScreen() {
       if (!res) return;
       setInferMs(res.inferMs);
       setInk(res.ink);
+      setLiveCount(next.length);
       if (isBlank(res.ink)) {
         // 擦干净了：把跟踪器清空，别让上一笔的残留判断留在候选栏
         // （阈值统一走 hook 导出的 isBlank，避免这里再写一个魔数）
@@ -225,10 +234,16 @@ export default function PlayScreen() {
 
   const onPoint = useCallback(
     (next: Stroke[]) => {
+      // 早先这里是 `if (session.state !== 'playing') return;`——但那意味着
+      // **第一笔从头到尾都不会被推理**：落笔时状态还是 'ready'，而把它推到
+      // 'playing' 的 start() 直到抬手那一次 applyResult 里才调用。
+      // 于是"跟着手指走"只在第二笔以后才成立，第一笔画得再久候选栏都是空的。
+      // 现在落笔就开局，边画边判从第一个点开始。
+      if (session.state === 'ready') session.start(Date.now());
       if (session.state !== 'playing') return;
       applyResult(next, false);
     },
-    [applyResult, session.state],
+    [applyResult, session],
   );
 
   const undo = useCallback(() => {
@@ -357,7 +372,7 @@ export default function PlayScreen() {
         mode={mode}
         pct={Math.round(snap.closeness * 100)}
         rank={snap.rank}
-        strokeCount={strokes.length}
+        strokeCount={liveCount}
         secs={Math.round((snap.elapsedMs || 0) / 1000)}
         ink={Math.round(ink)}
         minInk={spec.minInk}

@@ -4,14 +4,21 @@
 
 画布上画一只猫，屏幕下方实时跳出一排候选词和概率——1~2 毫秒一次，全部在你手机里算完。没有网络请求，没有云端推理，没有账号。
 
-模型 236 KB，148 个类别，推理引擎是一段手写的 TypeScript。
+模型 310 KB、307K 个参数、148 个类别，推理引擎是一段手写的 TypeScript。
 
 ```
-assets/model/doodlemind-v1.json   321 KB   int8 权重 + base64
+assets/model/doodlemind-v4.json   421 KB   int8 权重 + base64（打包进 App 的就是它）
+assets/model/doodlemind-v4.bin    310 KB   同一份权重的紧凑二进制（调试用）
 assets/images/icon.png             62 KB   用 App 自己的笔刷画的
-src/lib/model.ts                  ~290 行  3×3 卷积 / maxpool / GAP / FC
+src/lib/model.ts                  ~330 行  3×3 卷积 / depthwise / 1×1 / maxpool / GAP / FC
 src/lib/raster.ts                 32×32 栅格化（与训练侧逐位一致）
 ```
+
+| 开始 | 挑战 | 关于 |
+| --- | --- | --- |
+| ![首页](docs/shots/home.png) | ![挑战](docs/shots/v4-play.png) | ![关于](docs/shots/about.png) |
+
+（截图来自 web 预览，所以顶部那条深色胶囊是 `NativeTabs` 的 web 实现——它在 iOS 上是系统原生的底部标签栏。）
 
 ## 三种玩法
 
@@ -47,22 +54,65 @@ iOS 上用 Expo Go 就能跑，不需要 Xcode、不需要 Mac、不需要开发
 
 ## 为什么不用 TensorFlow.js
 
-一个 236 KB 的固定拓扑模型，用 tfjs 意味着拉进 ~1.5 MB 的运行时、一层 WebGL/WebGPU 后端适配、还有 JIT 之外的算子调度开销。而我们需要的东西只有四种算子。
+一个固定拓扑的小模型，用 tfjs 意味着拉进 ~1.5 MB 的运行时、一层 WebGL/WebGPU 后端适配、还有 JIT 之外的算子调度开销。而我们需要的东西只有四种算子。
 
 手写的版本：
 
 - **零依赖**，`src/lib/model.ts` 只 import 了 `Float32Array`
-- **~7M 次乘加**，iPhone 13 上单次 3~8 ms（比一帧 16 ms 还短，所以可以在手指移动时同步跑）
+- **约 9M 次乘加**，实测单次 8.5 ms（比一帧 16 ms 还短，所以可以在手指移动时同步跑）
 - 复用两个 `Float32Array` 缓冲，稳态运行时**零分配**，不触发 GC
-- 首次 forward 空跑一次做 V8 预热，避免第一笔卡顿
+- 首次 forward 空跑一次做预热，避免第一笔卡顿
 
 代价是这段代码只认我们自己的二进制格式（见下），换模型要重新导。对一个自包含的小工具，这个代价是划算的。
 
+## 为什么是可分离卷积
+
+这一节值得单独写，因为「模型要更聪明」和「要能在手机上实时跑」看起来矛盾，但解法不是取中间值，而是换结构。
+
+先量清楚瓶颈。`tools/bench_layers.mjs` 把一次推理的乘加数按层摊开：
+
+| 层 | 形状 | 乘加 | 占比 |
+| --- | --- | --- | --- |
+| block1 | 32×32, 1→32 | 0.29 M | 2.9% |
+| block2 | 16×16, 32→64 | 4.72 M | **45.6%** |
+| block3 | 8×8, 64→96 | 3.54 M | 34.2% |
+| block4 | 4×4, 96→128 | 1.77 M | 17.1% |
+| head | 128→148 | 0.02 M | 0.2% |
+
+再对比实测时间：10.34 M 次乘加跑 11.38 ms，**有效算力 0.91 GMAC/s**。时间和乘加数几乎是线性关系——说明瓶颈不在循环写法，而在乘加数本身。
+
+先确认循环没得优化了，两个反直觉的实验：
+
+- 把 9-tap 展开改成「按 tap 连续累加」：**慢 0.75 倍**
+- 改成「行缓冲累加」（一行输出只写一次）：**慢 0.82 倍**
+
+现有的 9-tap 展开已经贴着 V8 在这套内存布局上的上限。这条路走到头了。
+
+于是换结构。同形状下（16×16, 32→64）实测：
+
+| 实现 | 乘加 | 时间 |
+| --- | --- | --- |
+| 普通 3×3 | 4.72 M | 4.108 ms |
+| depthwise 3×3 + pointwise 1×1 | 0.60 M | 0.594 ms |
+
+**实测加速 6.92 倍**（理论 7.89 倍），可分离卷积几乎吃满了理论收益。省下来的预算全部换成通道数：从 24/48/96/128 加到 48/160/320/512，参数量 182K → 307K，而推理时间从 11.38 ms 降到 8.18 ms。
+
+准确率也没有让步——同一份 4500 张/类的数据、70 轮训练：
+
+| 结构 | 参数量 | 验证集 top-1 | top-5 | 端上单次推理 |
+| --- | --- | --- | --- | --- |
+| 普通 3×3（24/48/96/128） | 182K | 0.8138 | 0.9609 | 11.38 ms |
+| 可分离（48/160/320/512） | 307K | **0.8180** | **0.9635** | **8.18 ms** |
+
+也就是说：**更准、更宽、更快，同时**。代价是实现里多两种算子（depthwise 和 1×1），`src/lib/model.ts` 从 3 个函数变成 5 个。
+
 ## 权重是 int8，激活是 float32
 
-卷积权重按输出通道做对称量化（`w_scale = max|w| / 127`），4 个卷积块共 1.7 MB → 236 KB。**但激活不量化**——解量化后全用 `Float32Array` 算。
+卷积权重按输出通道做对称量化（`w_scale = max|w| / 127`），fp32 的几 MB 压到这个体积（见上方规格表与「关于」页）。**但激活不量化**——解量化后全用 `Float32Array` 算。
 
-原因很直接：JS 里 int8 整数运算并不比 float 快（没有 SIMD，反而多一层拆包/重打包），而激活量化会在 4 段卷积里累积误差，实测掉好几个点准确率。权重量化省的是**包体积**和**解析时间**，这才是我们真正需要省的东西。
+原因很直接：JS 里 int8 整数运算并不比 float 快（没有 SIMD，反而多一层拆包/重打包），而激活量化会在几段卷积里累积误差，实测掉好几个点准确率。权重量化省的是**包体积**和**解析时间**，这才是我们真正需要省的东西。
+
+分类头（`128→148` 的那层全连接）也量化成 int8。它占了整包三成的体积，而 GAP 的输出非负、量级集中，每类的动态范围差异正好被 per-class scale 吃掉——实测只掉 0.2 个点。
 
 BatchNorm 在导出时被折进卷积（`k = γ/√(σ²+ε)`，`w' = w·k`，`b' = β − μ·k`），端上不用管 BN。
 
@@ -83,28 +133,34 @@ BatchNorm 在导出时被折进卷积（`k = γ/√(σ²+ε)`，`w' = w·k`，`b
 
 ```bash
 python tools/fetch_data.py --per-class 4500    # 拉数据、栅格化 → tools/out/doodles.npz
-python tools/train.py                          # → tools/out/doodlenet.pt
-python tools/export_model.py                   # → assets/model/doodlemind-v1.{bin,json}
+python tools/train.py --arch sep --width 48,160,320,512 \
+                      --epochs 70 --batch 256 --per-class 4500 --device cuda \
+                      --out doodlenet_sep.pt    # → tools/out/doodlenet_sep.pt
+python tools/export_model.py --ckpt doodlenet_sep.pt --name doodlemind-v4
 node  tools/check-raster.mjs                   # 第一道：栅格化
 node  tools/check-engine.mjs                   # 第二道：跨语言推理一致性
 node  tools/check-game.mjs                     # 第三道：玩法状态机
 ```
 
-训练配方：AdamW + OneCycle、label smoothing 0.08、30% 概率 mixup、仿射增强（旋转 ±13°、缩放 0.82–1.14、gamma 抖动）。
+`check-engine.mjs` 不用传模型名：它会从 `src/hooks/use-doodle-ai.ts` 里读出 App 实际 `require` 的那个文件。写死常量意味着换模型时要记得改两处，而「忘了改」的后果不是报错，是 CI 兴高采烈地校验一个早已淘汰的旧模型、然后放行一个没验过的新模型。
 
-`tools/train.py` 认 `--device auto|cpu|cuda`。这个网只有 18 万参数，看起来「这么小还要 GPU？」——但它一轮要过 42 万张图，瓶颈在吞吐不在显存：
+参考向量也按模型名分文件（`tools/vectors/test_vectors_<name>.json`），缺了直接报错。这一点是被真事故教出来的：早期用固定文件名，导出探针模型时把主力模型的向量覆盖了，于是「一致率 67%」看起来像引擎写错，实际是标尺拿错了。
 
-| 设备 | 每轮 | 30 轮 |
-| --- | --- | --- |
-| CPU（20 核） | 210–260 s | ~2 小时 |
-| RTX 3060 12G | **23–26 s** | ~12 分钟 |
+训练配方：AdamW + OneCycle、label smoothing 0.08、30% 概率 mixup、仿射增强（旋转 ±13°、缩放 0.82–1.14、gamma 抖动）、以及为「边画边判」加的 cutout（见下）。
 
-差 10 倍。想用 GPU 得装 CUDA 版 torch（默认从 PyPI 装的是 `+cpu` 构建，`torch.cuda.is_available()` 直接是 `False`）：
+`tools/train.py` 认 `--device auto|cpu|cuda`。这个网只有 30 万参数，看起来「这么小还要 GPU？」——但它一轮要过 63 万张图，瓶颈在吞吐不在显存：
+
+| 设备 | 每轮（sep, 4500/类） |
+| --- | --- |
+| CPU（20 核） | 约 4–5 分钟 |
+| RTX 3060 12G | **69 s** |
+
+想用 GPU 得装 CUDA 版 torch（默认从 PyPI 装的是 `+cpu` 构建，`torch.cuda.is_available()` 直接是 `False`）：
 
 ```bash
 pip install --index-url https://download.pytorch.org/whl/cu126 --upgrade "torch==2.14.1+cu126"
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-python tools/train.py --device cuda --batch 512
+python tools/train.py --device cuda
 ```
 
 `--device auto` 是默认值：有卡就用卡，没卡回落到 CPU，不会因为「装了 CUDA 版但驱动不认」而中途炸掉。存档时权重一律 `.detach().cpu()`——导出脚本在纯 CPU 上跑，存 CUDA 张量会让它必须记得传 `map_location`，漏一次就是一堆难查的报错。
@@ -227,6 +283,82 @@ npx tsc --noEmit       # 类型检查
 
 ---
 
+## 边画边判：它在你还没画完的时候就开口了
+
+难点不在推理速度，在**训练数据的分布**。QuickDraw 里全是画完的图，只喂这些，模型会养成「等笔画齐了再表态」的习惯：画到第三笔还是 12%，一松手跳到 90%。人会觉得它反应慢，其实它一直在等。
+
+三件事一起改：
+
+**1. 训练时把图抹掉一块。** `tools/train.py` 的 `cutout()`：
+
+- 半平面抹除（概率 0.25）——随机把上/下/左/右一半置零，最像「只画了一半」
+- 矩形挖洞（概率 0.45）——边长 18%~42% 的方块，随机位置
+
+等于告诉它「只有这些证据也要给答案」。推理路径一点没变重，只是学会了不依赖完整轮廓。
+
+**2. 节流间隔按实测耗时自适应。** 原来是固定 140 ms：慢机器上照样掉帧，快机器上候选栏半秒不跳一次。现在跑完一帧就把下一次排到 `max(60, cost × 2.2)`——快机多猜，慢机自己退让，下限 60 ms（再快人眼也分不出，只烧电）。
+
+**3. 落笔那一刻就开始推理。** 原先 `onPoint` 里写着 `if (state !== 'playing') return`，而把状态推到 `playing` 的 `start()` 要等到抬手才调用——于是整条第一笔画得再久，候选栏都是空的。现在 `onPoint` 自己负责开表。
+
+顺带修了一个同类问题：判读区的「N 笔」原来读 `strokes.length`，而 `setStrokes` 只在抬手时调用，所以整条笔画过程中它一直显示「还没落笔，它只能瞎猜」。改成 `liveCount`，跟推理一起更新。
+
+顺带还有一个：卷积的循环顺序从「输入通道在外」改成「输出通道在外」。原来每个 tap 都要把 32×32×128 的输出平面（512 KB）各摸一遍，远超 CPU 缓存。Node 上 16.4 ms → 13.7 ms。
+
+边画边判的效果可以用 `cdp.mjs` 的脚本量化：按住不放绕一个圆，在 25% / 50% / 75% / 100% 处读判读区。修之前各阶段读数是 `—`（从没推理过），修之后是 `11 / 9 / 8 / 9 ms`，排名一路在动——全程手指没松。
+
+### 怎么证明它真的「边画边判」了
+
+拿最终 top-1 去衡量是没用的：那个数字是在**画完的图**上算的，模型完全可能画完 81%、半张图 30%，体感就是「一直不说话，松手才跳」。
+
+`tools/eval_partial.py` 按笔画总弧长把样本截断到 25% / 50% / 75% / 100%，再过**同一条栅格化管线**（直接 `from fetch_data import rasterize_np`，不另抄一份几何口径——口径一旦分家，两个脚本会给出互相矛盾的结论而且都不报错）。
+
+指标也不止 top-1。25% 弧长时人自己也认不出画的是什么，top-1 必然极低，但那不代表体验差。玩家真正看的是候选栏里有没有对的词、对的词排第几——所以还统计**前 6 命中率**（候选栏正好 6 格）和 **MRR**。
+
+1460 张未参与训练的原始样本，最终版（可分离卷积）与早期版（普通 3×3）的对照：
+
+| 弧长 | top-1 | 前 6 命中 | MRR | 排名中位 |
+|---|---|---|---|---|
+| 25% | 0.049 vs 0.052 | 0.146 vs 0.148 | 0.110 vs 0.110 | 32 vs 37 |
+| **50%** | **0.201 vs 0.178** | **0.545 vs 0.481** | **0.341 vs 0.311** | **4 vs 6** |
+| **75%** | **0.583 vs 0.553** | **0.884 vs 0.865** | **0.709 vs 0.683** | 0 vs 0 |
+| 100% | **0.838 vs 0.817** | 0.978 vs 0.975 | **0.897 vs 0.884** | 0 vs 0 |
+
+（左=可分离 48/160/320/512，右=普通 3×3 24/48/96/128。粗体行是「边画边判」真正吃劲的区间。）
+
+增益在**中段最明显**：50% 弧长时 top-1 +2.3 点、前 6 +6.4 点、MRR +0.030；75% 时 top-1 +3.0 点。两端几乎不变——刚起笔时凭什么都认不出，画完时本来就不缺证据。而且这不是拿实时性换来的：100% 那一列同样涨了 2.1 个点。
+
+另一组对照（有 cutout 与无 cutout，同结构）也值得看一眼，它证明的是「训练数据分布」这件事：50% 弧长时 top-1 +6.1 点、前 6 +4.0 点，而 100% 几乎不动。两个改动叠加，才让「边画边判」从效果上成立，而不只是从代码上成立。
+
+---
+
+## 装到 iPhone 上：自己出 ipa
+
+`.github/workflows/ios.yml` 在 `macos-15` 上跑，产出**未签名**的 `DoodleMind-unsigned.ipa`。Windows 上签不了名，也不需要——签名是安装那一步的事。
+
+三种触发方式：
+
+```bash
+# 1. 推 tag，自动发 Release，直接下 ipa
+git tag v1.0.0 && git push origin v1.0.0
+
+# 2. 手动跑一次（GitHub 页面 Actions → iOS → Run workflow）
+# 3. 开 PR，只验证能不能编过，不发 Release
+```
+
+构建流程：`npm ci` → `tsc` + `eslint` → **三道纯逻辑闸门先跑**（栅格化 / 跨语言一致性 / 状态机，模型没导出好就不该浪费 20 分钟编译）→ `expo prebuild` 生成 `ios/` → `pod install` → `xcodebuild` 关掉一切签名 → 打包成 ipa → 校验结构（有 `Payload/*.app`、无 `_CodeSignature`、包内不含 `/Users/runner` 这类构建机路径）→ 上传 artifact。
+
+下载后任选一个自签工具装：
+
+| 工具 | 说明 |
+| --- | --- |
+| [Sideloadly](https://sideloadly.io) | Windows 上直接拖 ipa 进去，填 Apple ID，7 天有效 |
+| [AltStore](https://altstore.io) / [SideStore](https://sidestore.io) | 装一次，之后每 7 天自动续签（SideStore 只需每 7 天在同一 Wi-Fi 下开机一次） |
+| Xcode | 有 Mac 的话，`Window → Devices` 拖进去 |
+
+免费 Apple ID 签的 App **7 天过期**，重签即可，画册里存的记录不会丢（在 App 沙盒里）。
+
+---
+
 ## 目录
 
 ```
@@ -259,31 +391,50 @@ src/
 tools/
   fetch_data.py        数据管线（流式读 ndjson，读够就断）
   raster.py            栅格化权威实现
-  train.py             PyTorch 训练
-  export_model.py      折 BN / int8 量化 / 二进制打包
+  train.py             PyTorch 训练（--arch dense|sep、cutout 增强、--device cuda）
+  export_model.py      折 BN / int8 量化 / 二进制打包 / 生成参考向量
   make_raster_vectors.py  导出栅格化参考样本
+  eval_partial.py      按弧长截断样本，量化「边画边判」的中间态表现
+  bench_layers.mjs     按层统计乘加数与占比，找性能预算在哪
+  bench_sep.mjs        可分离卷积 vs 普通 3×3 的实测价格
   check-raster.mjs     第一道闸门：栅格化（逐像素 + 平移不变性）
-  check-engine.mjs     第二道闸门：跨语言推理一致性
+  check-engine.mjs     第二道闸门：跨语言推理一致性（自动找 App 加载的模型）
   check-game.mjs       第三道闸门：玩法状态机
   make_icons.py        图标：用同一套笔刷规则画一只猫
+  vectors/             三道闸门的参考数据（入库，CI 要用）
+.github/
+  workflows/ios.yml    在 macOS runner 上出未签名 ipa
 ```
 
 画册里存的是**笔画矢量**（`[[x,y],...]`，8~20 KB）而不是渲染好的截图（1080p PNG 约 400 KB）。重绘时按当前屏幕宽度重新算路径，所以缩略图在任何设备上都清晰。
 
 ---
 
-## 模型格式（v2）
+## 模型格式（v4）
 
 全小端：
 
 ```
 "DDMN"                    4B   magic
-<B nBlocks, H nClasses, H>…   头
-  每块：<H cin, H cout>  f32 wScale[cout]  f32 bias[cout]  int8 w[cout*cin*9]
-<H width>                 f32 headW[nClasses*width]  f32 headB[nClasses]
+<B version=4, H nClasses, H nOps>
+  每 op：<B type, B flags>  <H cin, H cout>  f32 wScale[]  f32 bias[cout]  int8 w[]
+<H width>  f32 headScale[nClasses]  int8 headW[nClasses*width]  f32 headB[nClasses]
 ```
 
-权重行主序 `(cout, cin, ky, kx)`。端上解量化成 `Float32Array` 常驻，236 KB → 728 KB 内存。
+- `type`：`0` 普通 3×3，`1` depthwise 3×3，`2` pointwise 1×1
+- `flags` 的 bit0：这个 op 之后接一个 2×2 最大池化
+- 权重个数由 type 决定：普通 3×3 是 `cout*cin*9`，depthwise 是 `cin*9`（torch 对 `groups=cin` 只存一份权重，所以 `w.shape` 是 `(c,1,3,3)`），1×1 是 `cout*cin`
+- scale 的粒度也跟着 type：普通卷积与 1×1 按输出通道一条 scale，depthwise 按输入通道一条
+
+权重行主序。端上解量化成 `Float32Array` 常驻。
+
+**为什么要发明一个带 op 类型的格式**：v2/v3 假设拓扑固定（4 段同构卷积），端上是 4 个硬编码的 `conv3x3` 调用。换成可分离卷积后同一个「层」里有两个算子，拓扑不再是「4 段」而是「7 个 op」，把结构写进数据里，端上就变成一个小解释器——以后再加算子（比如 5×5 或残差）不用改二进制布局。
+
+池化点挂在「每段的最后一个 op」上，这是最容易写错的地方：可分离卷积一段有 dw+pw 两个 op，把池化挂在 dw 上等于在混通道之前就下采样，特征图会塌，而且不报错。
+
+v3 相比 v2 改的是分类头也量化成 per-class 对称 int8（分类头是 `(148,128)` fp32、整包三成）。v4 再加 op 类型。
+
+`parseModel` 同时认 v2 / v3 / v4，旧权重文件不会因为格式升级当场报废。
 
 ---
 

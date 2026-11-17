@@ -21,13 +21,14 @@ import { Glyph } from '@/components/glyph';
 import { Palette, Radius, Space, Typography } from '@/constants/design';
 import { MODES, MODE_ORDER, modeSummary, type Mode } from '@/lib/modes';
 import { loadHistory, summarize } from '@/lib/history';
-import { useDoodleModel } from '@/hooks/use-doodle-ai';
+import { useDoodleModel, useModelInfo } from '@/hooks/use-doodle-ai';
 
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const padTop = useScreenTop();
   const router = useRouter();
   const { model, error, loadMs, classes } = useDoodleModel();
+  const info = useModelInfo();
 
   const [stats, setStats] = useState<{ rounds: number; won: number; best: number; winRate: number }>({
     rounds: 0,
@@ -77,7 +78,7 @@ export default function HomeScreen() {
           把它缩小吸顶、给背景加毛玻璃。这里只留副标与状态，不重复写第二遍名字。 */}
       <View style={styles.brand}>
         <Text style={styles.brandLine}>
-          一个只有 18 万参数的小网络，装在你手机里。{'\n'}
+          一个只有 {(info.params / 10000).toFixed(1)} 万参数的小网络，装在你手机里。{'\n'}
           它不会上网，也不知道自己错在哪。
         </Text>
         <View style={[styles.statusPill, error && styles.statusPillError]}>

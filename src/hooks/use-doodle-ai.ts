@@ -3,13 +3,14 @@
  *
  * 三个性能决策，都在真机上被验证过必要性：
  *
- * 1. **节流到 ~140ms 一次**。一次 forward 约 7M 次乘加，在中端 iPhone 上
- *    约 20~35ms。不节流的话每来一个触摸点都跑一遍，画得快时必掉帧。
+ * 1. **节流间隔按实测推理耗时自适应**。一次 forward 约 7M 次乘加，Node 上 16ms，
+ *    中端 iPhone 约 20~35ms。固定 140ms 太保守——手指还在动的时候候选栏要停
+ *    小半秒才跳一次，玩家会以为它卡住了。现在跑完一帧就按 `max(60, cost * 2.2)`
+ *    定下一次的间隔：机器快就多猜几次，机器慢就自动退让，两个目标都不牺牲。
  *
- * 2. **抬手必跑，中间点走节流**。玩家最在意的是「我画完这一笔它说了什么」，
- *    所以抬手那次永远不丢；画的过程中顺带更新，制造「它在实时盯着我」的感觉。
+ * 2. **抬手必跑，中间点走节流**。抬手那次永远不丢，保证「画完立刻给结论」。
  *
- * 3. **模型只在首次渲染时解析一次**。解量化 16 万个 int8 权重 + 建 Float32Array
+ * 3. **模型只在首次渲染时解析一次**。解量化 18 万个 int8 权重 + 建 Float32Array
  *    大约 30ms，不能放进推理路径。
  */
 
@@ -18,7 +19,7 @@ import { loadModel, type DoodleModel } from '@/lib/model';
 import { RASTER_SIZE, rasterize, type Stroke as RasterStroke } from '@/lib/raster';
 import type { Stroke } from '@/components/drawing-canvas';
 
-const payload = require('../../assets/model/doodlemind-v1.json');
+const payload = require('../../assets/model/doodlemind-v4.json');
 
 export type AiResult = {
   probs: Float32Array;
@@ -78,23 +79,38 @@ export function toRasterStrokes(strokes: Stroke[]): RasterStroke[] {
 
 /**
  * 实时推理。返回一个稳定的 `run` 函数，调用方按需节流。
+ *
+ * `force=false` 时如果距离上次推理还不到间隔就返回 null（表示"这一帧跳过"），
+ * 不是失败——调用方据此决定要不要重排候选栏。
  */
 export function useDoodleInfer(model: DoodleModel | null) {
   const bufRef = useRef<Uint8Array>(new Uint8Array(RASTER_SIZE * RASTER_SIZE));
-  const lastRef = useRef(0);
+  const lastAtRef = useRef(0);
+  /** 上一次实际耗时，用来定下一帧的间隔 */
+  const costRef = useRef(0);
+  /**
+   * 下一次允许推理的时刻。
+   *
+   * 自适应而不是固定 140ms：固定值在慢机器上仍会掉帧、在快机器上又白白让
+   * 候选栏半小时不跳一次。跑完一帧就把间隔定成 `cost * 2.2`（留一倍余量给
+   * 渲染和触摸事件），下限 60ms——再快人的眼睛也分不出，只会白烧电。
+   */
+  const nextAtRef = useRef(0);
 
   const run = useCallback(
     (strokes: Stroke[], force = false): AiResult | null => {
       if (!model || strokes.length === 0) return null;
       const now = Date.now();
-      if (!force && now - lastRef.current < 140) return null;
-      lastRef.current = now;
+      if (!force && now < nextAtRef.current) return null;
 
       const t0 = Date.now();
       const img = rasterize(toRasterStrokes(strokes), RASTER_SIZE);
       bufRef.current = img;
       const logits = model.predict(img, RASTER_SIZE);
       const inferMs = Date.now() - t0;
+
+      costRef.current = inferMs;
+      nextAtRef.current = t0 + Math.max(60, inferMs * 2.2);
 
       // softmax
       let max = -Infinity;
@@ -110,6 +126,7 @@ export function useDoodleInfer(model: DoodleModel | null) {
 
       let ink = 0;
       for (let i = 0; i < img.length; i++) ink += img[i];
+      lastAtRef.current = t0;
       return { probs, inferMs, ink: ink / 255 };
     },
     [model],
@@ -129,6 +146,11 @@ export function useModelInfo() {
       nClasses: payload.nClasses as number,
       width: payload.width as number[],
       format: payload.format as number,
+      // 参数量与结构与模型文件一起走，不在 TSX 里写死：
+      // 换模型时不会有"界面上的数字忘了改"这种假话。
+      params: (payload.params as number) ?? 0,
+      arch: (payload.arch as string) ?? 'dense',
+      ops: (payload.ops as { type: string; cin: number; cout: number; pool: boolean }[]) ?? [],
     }),
     [],
   );

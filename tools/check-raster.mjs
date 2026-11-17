@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const { rasterize, RASTER_SIZE } = await import(pathToFileURL(join(root, 'src/lib/raster.ts')).href);
 
-const data = JSON.parse(readFileSync(join(root, 'tools/out/raster_vectors.json'), 'utf8'));
+const data = JSON.parse(readFileSync(join(root, 'tools/vectors/raster_vectors.json'), 'utf8'));
 if (data.size !== RASTER_SIZE) {
   console.error(`✗ size 不一致：python=${data.size} ts=${RASTER_SIZE}`);
   process.exit(1);
