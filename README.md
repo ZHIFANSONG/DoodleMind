@@ -356,6 +356,29 @@ git tag v1.0.0 && git push origin v1.0.0
 
 免费 Apple ID 签的 App **7 天过期**，重签即可，画册里存的记录不会丢（在 App 沙盒里）。
 
+### 这个 workflow 踩过的四个坑
+
+写在这里，因为每一个都只在 CI 里出现、本地 Windows 完全看不出来，而且每个都要排十几分钟的队才知道结果。
+
+**一、`ls` 只有一个匹配目录时不打印目录名。**
+`workspace=$(ls *.xcworkspace | head -1)` 在仓库里只有一个 `.xcworkspace` 时，`ls` 会去列**它里面的内容**，变量被赋成 `contents.xcworkspacedata`，于是
+`xcodebuild: error: 'contents.xcworkspacedata' does not exist.`
+修法是用 shell 通配本身（`for d in *.xcworkspace` 或 `set --`），别借道 `ls`。
+
+**二、Xcode 按空格切 build setting，不按 `=` 切。**
+`OTHER_SWIFT_FLAGS=-file-prefix-map=/a=/b` 会让 swift driver 收到一个**完整 token** `-file-prefix-map=/a=/b`，它只认 `-file-prefix-map` + 一个独立参数，于是
+`error: Driver threw unknown argument: '-file-prefix-map=...'`
+必须写成空格分隔：`"OTHER_SWIFT_FLAGS=-file-prefix-map $PWD=/DoodleMind"`。C 侧的 `-ffile-prefix-map=/a=/b` 是单 token 合法写法，不用拆。
+
+**三、`unzip -l ... | head -20` 会在 `set -o pipefail` 下判失败。**
+`head` 读完就关管道，`unzip` 收到 SIGPIPE，整步失败。先重定向到文件再 `sed -n` 截取。
+
+**四、（最坑）Pods 的 script phase 用 `env -i` 另起一个 xcodebuild，外层 build setting 传不进去。**
+`expo-modules-jsi` 的 podspec 有个 script phase 跑 `apple/scripts/build-xcframework.sh`，脚本里是
+`(cd "$PACKAGE_DIR" && env -i PATH=... xcodebuild build -scheme ExpoModulesJSI ...)`。
+所以当 Xcode 26.3 的 Swift 把它里面一处 SE-0414 区域隔离诊断（`sending 'slot' risks causing data races`）从警告收紧成 error 时，**在命令行上加 `SWIFT_VERSION=5.0`、`SWIFT_STRICT_CONCURRENCY=minimal` 全都无效**——那两个 setting 只作用于我们自己的 target。
+唯一有效的杠杆是换工具链：workflow 里不再取「最新的 Xcode」，而是按 `26.0.0 → 26.0.1 → 26.1.0 → 26.1.1 → 26.2.0` 的顺序挑第一个存在的。
+
 ---
 
 ## 目录
