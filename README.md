@@ -356,7 +356,7 @@ git tag v1.0.0 && git push origin v1.0.0
 
 免费 Apple ID 签的 App **7 天过期**，重签即可，画册里存的记录不会丢（在 App 沙盒里）。
 
-### 这个 workflow 踩过的四个坑
+### 这个 workflow 踩过的六个坑
 
 写在这里，因为每一个都只在 CI 里出现、本地 Windows 完全看不出来，而且每个都要排十几分钟的队才知道结果。
 
@@ -386,8 +386,17 @@ git tag v1.0.0 && git push origin v1.0.0
 **四、（最坑）Pods 的 script phase 用 `env -i` 另起一个 xcodebuild，外层 build setting 传不进去。**
 `expo-modules-jsi` 的 podspec 有个 script phase 跑 `apple/scripts/build-xcframework.sh`，脚本里是
 `(cd "$PACKAGE_DIR" && env -i PATH=... xcodebuild build -scheme ExpoModulesJSI ...)`。
-所以当 Xcode 26.3 的 Swift 把它里面一处 SE-0414 区域隔离诊断（`sending 'slot' risks causing data races`）从警告收紧成 error 时，**在命令行上加 `SWIFT_VERSION=5.0`、`SWIFT_STRICT_CONCURRENCY=minimal` 全都无效**——那两个 setting 只作用于我们自己的 target。
-唯一有效的杠杆是换工具链：workflow 里不再取「最新的 Xcode」，而是按 `26.0.0 → 26.0.1 → 26.1.0 → 26.1.1 → 26.2.0` 的顺序挑第一个存在的。
+所以当某版 Xcode 的 Swift 把它里面一处 SE-0414 区域隔离诊断（`sending 'slot' risks causing data races`）从警告收紧成 error 时，**在命令行上加 `SWIFT_VERSION=5.0`、`SWIFT_STRICT_CONCURRENCY=minimal` 全都无效**——那两个 setting 只作用于我们自己的 target。换工具链也不行：Xcode 26.3 和 26.0.1 都报。
+
+试过把它的 `Package.swift` 从 `swiftLanguageModes: [.v6]` 降成 `[.v5]`，SE-0414 那条确实消失了，但立刻冒出两条新的（`'$' is not a valid digit in integer literal`、`call to global actor 'JavaScriptActor'-isolated initializer in a synchronous nonisolated context`）——这个包是按 Swift 6 语义写的，降模式只是换了一套规则，不是少检查几条。
+
+可行的杠杆只有一个：**改依赖源码**。`scripts/patch-expo-jsi.mjs` 把跨隔离边界传的那个裸指针装进一个 `@unchecked Sendable` 的盒子里（`DoodleMindUnsafeSlotBox`），语义上等价（那块内存本来就只在这一处被同步编码），只是把「我知道这里安全」这件事显式写出来。脚本是幂等的，找不到目标就 `exit 1`——依赖哪天改了形状，我要知道，不要静默跳过。
+
+**五、结构校验的判据只能管「自己产出的文件」。**
+一开始写的是「包内不得出现 `/Users/runner`」，结果 ipa 里 `hermesvm` / `React` / `ReactNativeDependencies` / `ExpoModulesJSI` 这些**第三方预编译框架**自带构建机路径，本工程改不掉。而且那只是 CI 的目录，不含任何个人信息。现在硬性判据只留 `main.jsbundle` 与 `Info.plist`，其余列出来但当信息看。
+
+**六、抹路径要抹在打包之前，不能抹在校验步骤里。**
+`main.jsbundle` 里有 Metro 记下的绝对路径（`/Users/runner/work/.../Build/Products/Release-iphoneos/...`）。我第一版把替换写在 workflow 的「校验」步里——那一步是对**已经打好的 ipa 解包后的副本**动手，校验愉快地通过了，但发出去的包里原样还在。现在放在 `scripts/build-ipa.sh` 里、`zip` 之前。
 
 ---
 

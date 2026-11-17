@@ -170,6 +170,28 @@ exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
 xcrun strip -S -x "$app/$exe"
 find "$app" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
 
+# 抹掉 JS bundle 里的构建机路径。这里**必须**在打包之前做：Metro 会把
+# 资源与模块的绝对路径写进 bundle（`/Users/runner/work/.../Build/Products/
+# Release-iphoneos/DoodleMind.app/...`）。bundle 是纯文本，替换前缀不会破坏
+# 任何偏移。
+#
+# 注意别只在 workflow 的「校验」步骤里抹——那一步是对已经打好的 ipa 解包后
+# 的副本动手，校验能过，但发出去的包里原样还在（踩过一次）。
+python3 - "$app/main.jsbundle" <<'PY'
+import os, sys
+p = sys.argv[1]
+if not os.path.exists(p):
+    print("没有 main.jsbundle，跳过")
+    raise SystemExit(0)
+d = open(p, 'rb').read()
+n = d.count(b'/Users/runner')
+if n:
+    d = d.replace(b'/Users/runner/work/DoodleMind/DoodleMind', b'/DoodleMind')
+    d = d.replace(b'/Users/runner', b'/runner')
+    open(p, 'wb').write(d)
+print(f"main.jsbundle: 抹掉 {n} 处构建机路径")
+PY
+
 rm -rf Payload DoodleMind-unsigned.ipa
 mkdir Payload
 cp -R "$app" Payload/
