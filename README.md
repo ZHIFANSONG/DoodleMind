@@ -334,7 +334,6 @@ npx tsc --noEmit       # 类型检查
 ## 装到 iPhone 上：自己出 ipa
 
 `.github/workflows/ios.yml` 在 `macos-15` 上跑，产出**未签名**的 `DoodleMind-unsigned.ipa`。Windows 上签不了名，也不需要——签名是安装那一步的事。
-
 三种触发方式：
 
 ```bash
@@ -404,6 +403,8 @@ tools/
   vectors/             三道闸门的参考数据（入库，CI 要用）
 .github/
   workflows/ios.yml    在 macOS runner 上出未签名 ipa
+scripts/
+  build-ipa.sh         编译 + 剥符号 + 打包（workflow 只负责调它）
 ```
 
 画册里存的是**笔画矢量**（`[[x,y],...]`，8~20 KB）而不是渲染好的截图（1080p PNG 约 400 KB）。重绘时按当前屏幕宽度重新算路径，所以缩略图在任何设备上都清晰。

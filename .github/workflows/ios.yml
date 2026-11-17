@@ -66,60 +66,11 @@ jobs:
           agvtool new-marketing-version "$v"
           agvtool new-version -all "$(git rev-list --count HEAD)"
 
+      # 编译逻辑在 scripts/build-ipa.sh 里，不写在 workflow 里：
+      # 这段反复出问题（scheme 取法、strip 作用对象、管道 SIGPIPE），
+      # 放在文件里能本地对着看、在日志里逐行定位，而不是每次改完 push 一次等排队。
       - name: 编译未签名 ipa
-        run: |
-          set -euo pipefail
-          cd ios
-          workspace=$(ls *.xcworkspace | head -1)
-          # 不能拿 workspace 名去掉后缀当 scheme：Expo prebuild 生成的 scheme
-          # 是 app 的 displayName，和 workspace 目录名不一定一致（中文名、空格都会出问题）。
-          # 从 xcodebuild 自己吐的清单里取第一个 scheme 才靠得住。
-          scheme=$(xcodebuild -list -json -workspace "$workspace" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["workspace"]["schemes"][0])')
-          echo "workspace=$workspace scheme=$scheme"
-          test -n "$scheme"
-
-          # 三件事同时做：
-          # 1. 关掉一切签名（CODE_SIGNING_ALLOWED=NO 是唯一真正管用的那个）
-          # 2. -file-prefix-map / -ffile-prefix-map 把构建机的家目录从调试信息里抹掉，
-          #    否则包里会留下 /Users/runner/work/... 这样的路径
-          # 3. 显式指定 generic/platform=iOS，不然会挑模拟器架构，产物装不上真机
-          xcodebuild build \
-            -workspace "$workspace" \
-            -scheme "$scheme" \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
-            DEVELOPMENT_TEAM="" \
-            OTHER_SWIFT_FLAGS="-file-prefix-map=$PWD=/DoodleMind" \
-            OTHER_CFLAGS="-ffile-prefix-map=$PWD=/DoodleMind" \
-            > xcodebuild.log 2>&1 || true
-
-          # 先打一遍摘要，再判定。xz 日志几千行全吐出来会把 CI 页面刷爆
-          grep -E 'error:|BUILD ' xcodebuild.log | tail -40 || true
-          grep -q 'BUILD SUCCEEDED' xcodebuild.log || { echo "编译失败，末尾日志："; tail -80 xcodebuild.log; exit 1; }
-
-          app=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
-          echo "产物 $app"
-          test -d "$app"
-
-          # 去掉签名残留与调试符号里的绝对路径。
-          # strip 要作用在**可执行文件**上：直接对 .app 目录调会被当成打不开的文件，
-          # 静默失败（所以以前那行 `|| true` 其实什么都没剥）。
-          rm -rf "$app/_CodeSignature"
-          exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
-          xcrun strip -S -x "$app/$exe"
-          find "$app" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
-
-          rm -rf Payload DoodleMind-unsigned.ipa
-          mkdir Payload
-          cp -R "$app" Payload/
-          zip -qry DoodleMind-unsigned.ipa Payload
-          ls -lh DoodleMind-unsigned.ipa
+        run: bash scripts/build-ipa.sh
 
       - name: 校验 ipa 结构
         run: |
