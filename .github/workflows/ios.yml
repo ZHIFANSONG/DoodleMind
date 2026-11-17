@@ -57,11 +57,11 @@ jobs:
       - name: 装依赖
         run: npm ci
 
-      # 必须在 pod install 之前打：expo-modules-jsi 的 SPM 包声明了
-      # swiftLanguageModes: [.v6]，其中一处 SE-0414 判定在 Xcode 26 下是 error，
-      # 而那是 Pods 的 script phase 用 `env -i` 另起 xcodebuild 编的，
+      # 必须在 pod install 之前打。expo-modules-jsi 有一行在 Xcode 26 的 Swift 6
+      # 语言模式下被判 SE-0414 区域隔离 error（sending 'slot' risks causing data
+      # races），而那是 Pods 的 script phase 用 `env -i` 另起 xcodebuild 编的，
       # 外层命令行传 SWIFT_VERSION 无效。详见 scripts/patch-expo-jsi.mjs 的注释。
-      - name: 给 expo-modules-jsi 打 Swift 5 语言模式补丁
+      - name: 修 expo-modules-jsi 的 SE-0414 误报
         run: node scripts/patch-expo-jsi.mjs
 
       - name: 类型与 lint 闸门
