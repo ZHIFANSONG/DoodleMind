@@ -82,8 +82,15 @@ fi
 echo "scheme=[$scheme]"
 test -n "$scheme"
 
-# 构建参数。Pods 已经装好，正常情况必须走 workspace——只给 -project 会
-# 找不到 Pods 的 target，链接阶段报一堆 undefined symbol。
+# 关于“抹掉构建机路径”：miniWatts 用的是 OTHER_SWIFT_FLAGS / OTHER_CFLAGS 里的
+# file-prefix-map。它值得保留——Swift 的 assert 消息会把 #file 的绝对路径当字面量
+# 编进二进制，包内就会留下 /Users/runner/work/...。
+#
+# 但要注意写法：Xcode 把 build setting 的值按**空格**切成 argv，不按 `=` 切。
+# 所以 `OTHER_SWIFT_FLAGS=-file-prefix-map=/a=/b` 会让 swift driver 收到一个
+# 完整的 `-file-prefix-map=/a=/b` token，它只认 `-file-prefix-map` + 一个参数，
+# 于是报 unknown argument。必须写成空格分隔。
+# C 侧的 `-ffile-prefix-map=/a=/b` 是单 token 合法写法，不用拆。
 common=(
   -scheme "$scheme"
   -configuration Release
@@ -94,22 +101,32 @@ common=(
   CODE_SIGN_IDENTITY=""
   CODE_SIGN_ENTITLEMENTS=""
   DEVELOPMENT_TEAM=""
-  # 把构建机的家目录从调试信息里抹掉，否则包里会留下 /Users/runner/work/...
-  "OTHER_SWIFT_FLAGS=-file-prefix-map=$PWD=/DoodleMind"
+  DEBUG_INFORMATION_FORMAT=dwarf
+  SWIFT_COMPILATION_MODE=wholemodule
+)
+map_flags=(
+  "OTHER_SWIFT_FLAGS=-file-prefix-map $PWD=/DoodleMind"
   "OTHER_CFLAGS=-ffile-prefix-map=$PWD=/DoodleMind"
 )
 
+run_build() {
+  xcodebuild build "$@" > xcodebuild.log 2>&1 || true
+  grep -q 'BUILD SUCCEEDED' xcodebuild.log
+}
+
 if [ -n "$workspace" ] && [ -f "$workspace/contents.xcworkspacedata" ]; then
-  echo "── 用 workspace 构建 ──"
-  xcodebuild build -workspace "$workspace" "${common[@]}" > xcodebuild.log 2>&1 || true
-elif [ -n "$project" ]; then
-  # 兜底：workspace 缺失或不完整时退回 project。Pods 情况下链接大概率失败，
-  # 但至少能看到真正的编译错误，而不是卡在取 scheme 那一步。
-  echo "── workspace 不可用，退回 project 构建 ──"
-  xcodebuild build -project "$project" "${common[@]}" > xcodebuild.log 2>&1 || true
+  target_flags=(-workspace "$workspace")
 else
-  echo "既没有 .xcworkspace 也没有 .xcodeproj" >&2
-  exit 1
+  target_flags=(-project "$project")
+fi
+
+if ! run_build "${target_flags[@]}" "${common[@]}" "${map_flags[@]}"; then
+  if grep -q 'unknown argument.*file-prefix-map' xcodebuild.log; then
+    # 某个 toolchain 不认这个 flag 时不要让整轮 CI 白跑：去掉它重试一次。
+    # 代价只是包内可能留下构建机路径，那由末尾的结构校验兜底。
+    echo "── 该 toolchain 不认 file-prefix-map，去掉重试 ──"
+    run_build "${target_flags[@]}" "${common[@]}" || true
+  fi
 fi
 
 grep -E 'error:|BUILD ' xcodebuild.log | tail -40 || true
