@@ -365,10 +365,20 @@ git tag v1.0.0 && git push origin v1.0.0
 `xcodebuild: error: 'contents.xcworkspacedata' does not exist.`
 修法是用 shell 通配本身（`for d in *.xcworkspace` 或 `set --`），别借道 `ls`。
 
-**二、Xcode 按空格切 build setting，不按 `=` 切。**
+**二、Xcode 按空格切 build setting，不按 `=` 切；而且在命令行上写 `OTHER_CFLAGS` 是硬覆盖。**
 `OTHER_SWIFT_FLAGS=-file-prefix-map=/a=/b` 会让 swift driver 收到一个**完整 token** `-file-prefix-map=/a=/b`，它只认 `-file-prefix-map` + 一个独立参数，于是
 `error: Driver threw unknown argument: '-file-prefix-map=...'`
 必须写成空格分隔：`"OTHER_SWIFT_FLAGS=-file-prefix-map $PWD=/DoodleMind"`。C 侧的 `-ffile-prefix-map=/a=/b` 是单 token 合法写法，不用拆。
+
+更隐蔽的一半：命令行上给 `OTHER_CFLAGS` / `OTHER_SWIFT_FLAGS` 赋值会**覆盖** pod 在 `pod_target_xcconfig` 里设的同名设置，除非你显式写上 `$(inherited)`。踩过一次：`react-native-worklets` 的 podspec 靠 `OTHER_CFLAGS` 注入 `-DWORKLETS_VERSION=0.13.0`，被我覆盖掉之后
+`WorkletsVersion.cpp:19: error: use of undeclared identifier 'WORKLETS_VERSION_STRING'`
+——错误指向依赖源码，完全看不出是自己的编译参数干的。所以：
+
+```bash
+"OTHER_CFLAGS=\$(inherited) -ffile-prefix-map=$PWD=/DoodleMind"
+```
+
+（shell 里 `$` 要写成 `\$`，否则会被当场展开。）
 
 **三、`unzip -l ... | head -20` 会在 `set -o pipefail` 下判失败。**
 `head` 读完就关管道，`unzip` 收到 SIGPIPE，整步失败。先重定向到文件再 `sed -n` 截取。

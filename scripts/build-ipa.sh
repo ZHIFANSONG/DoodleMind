@@ -104,9 +104,15 @@ common=(
   DEBUG_INFORMATION_FORMAT=dwarf
   SWIFT_COMPILATION_MODE=wholemodule
 )
+# `$(inherited)` 不能省。命令行上给 OTHER_CFLAGS / OTHER_SWIFT_FLAGS 是**硬覆盖**：
+# 不写 $(inherited)，pod 自己在 pod_target_xcconfig 里加的那些 flag 就全丢了。
+# 踩过：react-native-worklets 的 podspec 就是靠 OTHER_CFLAGS 注入
+# `-DWORKLETS_VERSION=0.13.0`，被覆盖掉之后 WorkletsVersion.cpp 报
+# `use of undeclared identifier 'WORKLETS_VERSION_STRING'`——错误指向依赖源码，
+# 完全看不出是我们自己的编译参数干的。shell 里 $ 要转义成 \$ 才不会被当场展开。
 map_flags=(
-  "OTHER_SWIFT_FLAGS=-file-prefix-map $PWD=/DoodleMind"
-  "OTHER_CFLAGS=-ffile-prefix-map=$PWD=/DoodleMind"
+  "OTHER_SWIFT_FLAGS=\$(inherited) -file-prefix-map $PWD=/DoodleMind"
+  "OTHER_CFLAGS=\$(inherited) -ffile-prefix-map=$PWD=/DoodleMind"
 )
 
 run_build() {
