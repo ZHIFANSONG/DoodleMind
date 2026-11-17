@@ -14,15 +14,24 @@
  *    穿过原始点），所以显示出来的形状和存下来的几何是同一根线，做平滑只是让
  *    手指抖动的采样点看起来顺滑，不会改变模型看到的东西。
  *
- * 关于 `latest` 这个 ref：PanResponder 的回调是在组件渲染之外被系统调用的，
- * 如果直接把 props 闭包进 useMemo 的 responder，就会永久持有第一次渲染时的
- * strokes/color/回调——画画时颜色改了却不出效果，就是这个原因。
- * 所以用一个「最新值」快照，在 effect 里同步（effect 在 commit 之后跑，
- * 而手势回调一定晚于 commit，时序上是安全的）。
+ * 为什么用 View 的 responder 而不是 PanResponder.create：
+ * PanResponder 实例通常要塞进 useMemo（否则每次渲染都重建 responder 配置），
+ * 而 useMemo 的工厂函数在渲染期执行，一旦里面碰了 ref，React 的 lint 会（正确地）
+ * 判定为「渲染期读 ref」。View 的 onResponder* props 就是普通回调属性，每次渲染
+ * 传新的闭包即可，不需要任何 memo，也就不需要那套「最新值快照」的绕法。
+ *
+ * 仍然存在的那个 ref（activeRef）只在事件回调里读写——事件一定发生在渲染之后，
+ * 这是允许的。它解决的是另一个问题：手指移动的事件频率高于 React 的重渲染频率，
+ * 闭包里的 `active` state 会落后一两个点，用它累积笔画会丢点。
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { PanResponder, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
+import { memo, useCallback, useMemo, useRef, useState } from 'react';
+import {
+  StyleSheet,
+  View,
+  type GestureResponderEvent,
+  type LayoutChangeEvent,
+} from 'react-native';
 import Svg, { Path } from 'react-native-svg';
 
 export type Pt = { x: number; y: number };
@@ -88,6 +97,9 @@ const StrokePath = memo(function StrokePath({ stroke, size }: { stroke: Stroke; 
   );
 });
 
+/** 手指静止时同一像素会涌出大量重复点：既浪费栅格化时间，又让 CR 样条出尖刺 */
+const MIN_STEP_SQ = 0.00004;
+
 export default function DrawingCanvas({
   strokes,
   color,
@@ -100,106 +112,74 @@ export default function DrawingCanvas({
 }: Props) {
   const [size, setSize] = useState(0);
   const [active, setActive] = useState<Stroke | null>(null);
-
-  /** 手势回调看到的最新世界状态；只在 effect / 事件里读写 */
-  const latest = useRef({
-    strokes,
-    color,
-    enabled,
-    brushScale,
-    size: 0,
-    onPoint,
-    onStrokeEnd,
-    onStrokeStart,
-  });
   const activeRef = useRef<Stroke | null>(null);
 
-  useEffect(() => {
-    latest.current = {
-      ...latest.current,
-      strokes,
-      color,
-      enabled,
-      brushScale,
-      onPoint,
-      onStrokeEnd,
-      onStrokeStart,
-    };
-  });
-
   const onLayout = useCallback((e: LayoutChangeEvent) => {
-    const { width } = e.nativeEvent.layout;
-    latest.current.size = width;
-    setSize(width);
+    setSize(e.nativeEvent.layout.width);
   }, []);
 
-  const responder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => latest.current.enabled,
-        onMoveShouldSetPanResponder: () => latest.current.enabled,
-        onPanResponderGrant: (e) => {
-          const ctx = latest.current;
-          if (!ctx.enabled || ctx.size === 0) return;
-          const pt: Pt = {
-            x: e.nativeEvent.locationX / ctx.size,
-            y: e.nativeEvent.locationY / ctx.size,
-          };
-          const st: Stroke = {
-            pts: [pt],
-            color: ctx.color,
-            width: Math.max(2, ctx.size * ctx.brushScale),
-          };
-          activeRef.current = st;
-          setActive(st);
-          ctx.onStrokeStart?.();
-        },
-        onPanResponderMove: (e) => {
-          const cur = activeRef.current;
-          const ctx = latest.current;
-          if (!cur || ctx.size === 0) return;
-          const pt: Pt = {
-            x: e.nativeEvent.locationX / ctx.size,
-            y: e.nativeEvent.locationY / ctx.size,
-          };
-          // 距离过近的点丢掉：手指静止时会涌出大量重复点，
-          // 既浪费栅格化时间，又让 Catmull-Rom 出现尖刺
-          const last = cur.pts[cur.pts.length - 1];
-          const dx = pt.x - last.x;
-          const dy = pt.y - last.y;
-          if (dx * dx + dy * dy < 0.00004) return;
-
-          const next: Stroke = { ...cur, pts: [...cur.pts, pt] };
-          activeRef.current = next;
-          setActive(next);
-          ctx.onPoint?.([...ctx.strokes, next]);
-        },
-        onPanResponderRelease: () => {
-          const cur = activeRef.current;
-          activeRef.current = null;
-          setActive(null);
-          if (!cur) return;
-          const merged = [...latest.current.strokes, cur];
-          latest.current.strokes = merged;
-          latest.current.onStrokeEnd?.(merged);
-        },
-        onPanResponderTerminate: () => {
-          const cur = activeRef.current;
-          activeRef.current = null;
-          setActive(null);
-          if (!cur) return;
-          const merged = [...latest.current.strokes, cur];
-          latest.current.strokes = merged;
-          latest.current.onStrokeEnd?.(merged);
-        },
-      }),
-    [],
+  const pointOf = useCallback(
+    (e: GestureResponderEvent): Pt => ({
+      x: e.nativeEvent.locationX / size,
+      y: e.nativeEvent.locationY / size,
+    }),
+    [size],
   );
 
+  const begin = useCallback(
+    (e: GestureResponderEvent) => {
+      if (!enabled || size === 0) return;
+      const st: Stroke = {
+        pts: [pointOf(e)],
+        color,
+        width: Math.max(2, size * brushScale),
+      };
+      activeRef.current = st;
+      setActive(st);
+      onStrokeStart?.();
+    },
+    [enabled, size, pointOf, color, brushScale, onStrokeStart],
+  );
+
+  const extend = useCallback(
+    (e: GestureResponderEvent) => {
+      const cur = activeRef.current;
+      if (!cur) return;
+      const pt = pointOf(e);
+      const last = cur.pts[cur.pts.length - 1];
+      const dx = pt.x - last.x;
+      const dy = pt.y - last.y;
+      if (dx * dx + dy * dy < MIN_STEP_SQ) return;
+
+      const next: Stroke = { ...cur, pts: [...cur.pts, pt] };
+      activeRef.current = next;
+      setActive(next);
+      onPoint?.([...strokes, next]);
+    },
+    [pointOf, onPoint, strokes],
+  );
+
+  const end = useCallback(() => {
+    const cur = activeRef.current;
+    activeRef.current = null;
+    setActive(null);
+    if (!cur) return;
+    onStrokeEnd?.([...strokes, cur]);
+  }, [onStrokeEnd, strokes]);
+
   return (
-    <View style={styles.wrap} onLayout={onLayout} {...responder.panHandlers}>
+    <View
+      style={styles.wrap}
+      onLayout={onLayout}
+      onStartShouldSetResponder={() => enabled}
+      onMoveShouldSetResponder={() => enabled}
+      onResponderGrant={begin}
+      onResponderMove={extend}
+      onResponderRelease={end}
+      onResponderTerminate={end}
+      onResponderTerminationRequest={() => false}>
       {size > 0 && (
-        <Svg width={size} height={size} style={StyleSheet.absoluteFill}>
+        <Svg width={size} height={size} style={StyleSheet.absoluteFill} pointerEvents="none">
           {strokes.map((s, i) => (
             <StrokePath key={i} stroke={s} size={size} />
           ))}

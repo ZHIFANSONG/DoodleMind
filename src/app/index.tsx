@@ -17,11 +17,10 @@ import { useKeepAwake } from 'expo-keep-awake';
 
 import DrawingCanvas, { type Stroke } from '@/components/drawing-canvas';
 import { BrushColors, Palette, Radius, Space, Typography } from '@/constants/design';
-import { DEFAULT_ROUND, Round, hintFor, scoreRound, type RoundSnapshot } from '@/lib/game';
+import { DEFAULT_ROUND, Round, scoreRound, type RoundSnapshot } from '@/lib/game';
 import { appendRecord } from '@/lib/history';
 import { useDoodleInfer, useDoodleModel } from '@/hooks/use-doodle-ai';
 
-const ROUND_LIMIT = DEFAULT_ROUND.durationMs;
 const TOP_N = 6;
 
 type Session = { id: number; target: number; round: Round };
@@ -187,11 +186,9 @@ export default function GameScreen() {
   }, []);
 
   const requestHint = useCallback(() => {
-    if (round.state !== 'playing') return;
-    round.hintsUsed += 1;
-    setHint(hintFor(snap.rank, snap.closeness));
+    setHint(round.useHint());
     void Haptics.selectionAsync();
-  }, [round, snap]);
+  }, [round]);
 
   const next = useCallback(() => {
     const ns = makeSession(target);
@@ -364,8 +361,10 @@ function ResultOverlay({
   emoji: string;
   onNext: () => void;
 }) {
-  const scale = useRef(new Animated.Value(0.86)).current;
-  const fade = useRef(new Animated.Value(0)).current;
+  // Animated.Value 一旦创建就该固定不变，用 useState 的惰性初始化持有它。
+  // 用 useRef(...).current 会在渲染期读 ref，React 19 的 lint 会报错。
+  const [scale] = useState(() => new Animated.Value(0.86));
+  const [fade] = useState(() => new Animated.Value(0));
 
   useEffect(() => {
     Animated.parallel([

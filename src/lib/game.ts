@@ -130,6 +130,16 @@ export class Round {
     if (this.state === 'playing' || this.state === 'ready') this.state = 'skipped';
   }
 
+  /**
+   * 记一次使用提示。用方法而不是让调用方 `round.hintsUsed += 1`：
+   * 后者是跨模块直接改对象字段，React Compiler 会判定为对「来自 props/state 的值」
+   * 做原地变更而报错；把一个有语义的操作收进类里也更清楚。
+   */
+  useHint(): string {
+    this.hintsUsed += 1;
+    return hintFor(this.rank, this.closeness);
+  }
+
   snapshot(now: number): RoundSnapshot {
     const elapsed = this.state === 'ready' ? 0 : now - this.startedAt;
     const holdElapsed = this.holdStartedAt === 0 ? 0 : now - this.holdStartedAt;
