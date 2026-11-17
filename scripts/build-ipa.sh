@@ -120,12 +120,27 @@ else
   target_flags=(-project "$project")
 fi
 
-if ! run_build "${target_flags[@]}" "${common[@]}" "${map_flags[@]}"; then
-  if grep -q 'unknown argument.*file-prefix-map' xcodebuild.log; then
-    # 某个 toolchain 不认这个 flag 时不要让整轮 CI 白跑：去掉它重试一次。
-    # 代价只是包内可能留下构建机路径，那由末尾的结构校验兜底。
-    echo "── 该 toolchain 不认 file-prefix-map，去掉重试 ──"
-    run_build "${target_flags[@]}" "${common[@]}" || true
+# 逐级降级重试。每一条都对应一个真出现过的失败，而不是预防性猜测：
+# 一轮 macOS runner 排队 + 编译要十几分钟，为一个能在本地判断的兼容性问题
+# 白跑一轮是最亏的。
+succeeded=0
+if run_build "${target_flags[@]}" "${common[@]}" "${map_flags[@]}"; then
+  succeeded=1
+fi
+
+if [ "$succeeded" = 0 ] && grep -q 'unknown argument.*file-prefix-map' xcodebuild.log; then
+  echo "── 该 toolchain 不认 file-prefix-map，去掉重试 ──"
+  if run_build "${target_flags[@]}" "${common[@]}"; then succeeded=1; fi
+fi
+
+# expo-modules-jsi 在 Swift 6 语言模式下会被判 "sending 'slot' risks causing
+# data races"（区域隔离，SE-0414）。那是**依赖**里的代码，不该由我们改；
+# 而且我们的 App 是单线程时序逻辑，没有真并发。降回 Swift 5 语言模式 + minimal。
+if [ "$succeeded" = 0 ] && grep -qE 'risks causing data races|requires that .* be Sendable|Swift 6 language mode' xcodebuild.log; then
+  echo "── 依赖在 Swift 6 严格并发下过不了，降回 Swift 5 语言模式重试 ──"
+  if run_build "${target_flags[@]}" "${common[@]}" "${map_flags[@]}" \
+      SWIFT_VERSION=5.0 SWIFT_STRICT_CONCURRENCY=minimal SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY=NO; then
+    succeeded=1
   fi
 fi
 
