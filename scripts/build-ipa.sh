@@ -133,15 +133,16 @@ if [ "$succeeded" = 0 ] && grep -q 'unknown argument.*file-prefix-map' xcodebuil
   if run_build "${target_flags[@]}" "${common[@]}"; then succeeded=1; fi
 fi
 
-# expo-modules-jsi 在 Swift 6 语言模式下会被判 "sending 'slot' risks causing
-# data races"（区域隔离，SE-0414）。那是**依赖**里的代码，不该由我们改；
-# 而且我们的 App 是单线程时序逻辑，没有真并发。降回 Swift 5 语言模式 + minimal。
-if [ "$succeeded" = 0 ] && grep -qE 'risks causing data races|requires that .* be Sendable|Swift 6 language mode' xcodebuild.log; then
-  echo "── 依赖在 Swift 6 严格并发下过不了，降回 Swift 5 语言模式重试 ──"
-  if run_build "${target_flags[@]}" "${common[@]}" "${map_flags[@]}" \
-      SWIFT_VERSION=5.0 SWIFT_STRICT_CONCURRENCY=minimal SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY=NO; then
-    succeeded=1
-  fi
+# 如果撞上 expo-modules-jsi 的区域隔离报错（sending 'slot' risks causing data
+# races），在这里改任何 build setting 都没用：那个文件由 Pods 的 script phase
+# 跑 apple/scripts/build-xcframework.sh，用 `env -i` 另起 xcodebuild 编译 SPM 包，
+# 外层的 SWIFT_VERSION / SWIFT_STRICT_CONCURRENCY 传不进去。
+# 解法在 .github/workflows/ios.yml 的「选 Xcode」：换一个没把这条诊断当 error
+# 的 toolchain（实测 Xcode 26.3 会失败）。
+if [ "$succeeded" = 0 ] && grep -qE 'risks causing data races|requires that .* be Sendable' xcodebuild.log; then
+  echo "── 撞上 expo-modules-jsi 的 Swift 6 区域隔离报错 ──"
+  echo "   这不是本工程能改的：该文件由 Pods 的 script phase 用 env -i 另起 xcodebuild 编译。"
+  echo "   请改 .github/workflows/ios.yml 里的 Xcode 版本（26.3 会失败）。"
 fi
 
 grep -E 'error:|BUILD ' xcodebuild.log | tail -40 || true

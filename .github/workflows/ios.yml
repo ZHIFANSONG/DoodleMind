@@ -28,11 +28,30 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: 选最新 Xcode
+      # 不取"最新的 Xcode"。Xcode 26.3 的 Swift 把 expo-modules-jsi 里一处
+      # SE-0414 区域隔离诊断（sending 'slot' risks causing data races）
+      # 从警告收紧成了 error。
+      #
+      # 关键在于：那个文件不是我们的 target 编的。ExpoModulesJSI.podspec 里有个
+      # script phase 跑 apple/scripts/build-xcframework.sh，它用 `env -i` 另起一个
+      # xcodebuild 编自己的 SPM 包 —— 外层命令行传的 SWIFT_VERSION /
+      # SWIFT_STRICT_CONCURRENCY 一律进不去（env -i 就是清环境）。
+      # 所以只能从工具链这一层避开：优先用较低的 26.x。
+      - name: 选 Xcode
         run: |
-          latest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
-          echo "用 $latest"
-          sudo xcode-select -s "$latest"
+          set -euo pipefail
+          echo "可用的 Xcode："
+          ls -d /Applications/Xcode*.app || true
+          pick=""
+          for v in 26.0.0 26.0.1 26.1.0 26.1.1 26.2.0; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then pick="/Applications/Xcode_${v}.app"; break; fi
+          done
+          if [ -z "$pick" ]; then
+            # 兜底：取最旧的稳定版（排除 beta / release candidate）
+            pick=$(ls -d /Applications/Xcode*.app | grep -vi -e beta -e rc | sort -V | head -1)
+          fi
+          echo "用 $pick"
+          sudo xcode-select -s "$pick"
           xcodebuild -version
 
       - name: 装依赖
