@@ -1,0 +1,19 @@
+# 所有文本文件在仓库里一律 LF。
+# 特别重要的一条是 shell 脚本：CRLF 的 shebang 在 macOS 上会直接
+# `bad interpreter`，而这种错只在 CI 上出现，本地 Windows 看不出来。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.mjs  text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.yml  text eol=lf
+
+# 二进制
+*.png  binary
+*.ipa  binary
+*.bin  binary
+*.pt   binary
+*.npz  binary
