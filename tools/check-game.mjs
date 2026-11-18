@@ -190,6 +190,45 @@ console.log('\n提示');
   check('提示消耗计入 hintsUsed', s.hintsUsed === 1, `hintsUsed=${s.hintsUsed}`);
 }
 
+// ---------------------------------------------------------------- 闯关进度
+console.log('\n闯关进度');
+{
+  const C = await import(pathToFileURL(join(root, 'src/lib/campaign.ts')).href);
+  const { EMPTY_PROGRESS, SLOTS_PER_STAGE, STAGES } = C;
+
+  // 星数档位
+  check('≤9s 三星', C.starsForSlot(9000) === 3);
+  check('9~20s 两星', C.starsForSlot(9001) === 2 && C.starsForSlot(20000) === 2);
+  check('>20s 一星（过了就给一星）', C.starsForSlot(20001) === 1);
+
+  // 词表下标解析：类表里没有这个词要回落到 -1，而不是抛异常
+  const fake = STAGES[0].words.map((en) => ({ en }));
+  check('词表能解析到下标', C.wordIndexOf(0, 0, fake) === 0);
+  check('词表缺该词时返回 -1', C.wordIndexOf(99, 0, fake) === -1);
+  check('slot 越界返回 -1', C.wordIndexOf(0, 9, fake) === -1);
+
+  // 打一题的累积效果
+  let p = EMPTY_PROGRESS;
+  p = C.applySlot(p, 0, 0, 3, 5000);
+  check('记一题后有一颗星以上', C.stageStars(p, 0) === 3, `stars=${C.stageStars(p, 0)}`);
+  p = C.applySlot(p, 0, 0, 1, 30000);
+  check('星数只升不降', C.stageStars(p, 0) === 3, `stars=${C.stageStars(p, 0)}`);
+  check('四题没全过时不记通关用时', p.stages[0].bestMs === 0, `bestMs=${p.stages[0].bestMs}`);
+  check('还有题没过时不解锁下一关', C.unlockedStage(p) === 0);
+  check('下一题指向第一个空格', C.nextSlot(p, 0) === 1, `next=${C.nextSlot(p, 0)}`);
+
+  for (let i = 1; i < SLOTS_PER_STAGE; i++) p = C.applySlot(p, 0, i, 2, 12000);
+  check('四题都过之后解锁第 2 关', C.unlockedStage(p) === 1, `unlocked=${C.unlockedStage(p)}`);
+  check('整关通关后记下用时', p.stages[0].bestMs === 12000, `bestMs=${p.stages[0].bestMs}`);
+  check('通关后 nextSlot 返回 -1', C.nextSlot(p, 0) === -1);
+  check('总星数 = 各关之和', C.totalStars(p) === 3 + 2 * 3, `total=${C.totalStars(p)}`);
+
+  // 入参不能被改（进度是 React state，原地改会跳过重渲染）
+  const before = JSON.stringify(p);
+  C.applySlot(p, 0, 3, 1, 99000);
+  check('applySlot 不修改入参', JSON.stringify(p) === before);
+}
+
 console.log('');
 if (failures === 0) {
   console.log('玩法状态机：全部通过');

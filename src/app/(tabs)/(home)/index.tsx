@@ -21,6 +21,18 @@ import { Glyph } from '@/components/glyph';
 import { Palette, Radius, Space, Typography } from '@/constants/design';
 import { MODES, MODE_ORDER, modeSummary, type Mode } from '@/lib/modes';
 import { loadHistory, summarize } from '@/lib/history';
+import {
+  MAX_STARS_PER_STAGE,
+  SLOTS_PER_STAGE,
+  STAGES,
+  EMPTY_PROGRESS,
+  nextSlot,
+  totalStars,
+  unlockedStage,
+  type Progress,
+  type Stage,
+} from '@/lib/campaign';
+import { loadProgress } from '@/lib/progress';
 import { useDoodleModel, useModelInfo } from '@/hooks/use-doodle-ai';
 
 export default function HomeScreen() {
@@ -36,6 +48,7 @@ export default function HomeScreen() {
     best: 0,
     winRate: 0,
   });
+  const [prog, setProg] = useState<Progress>(EMPTY_PROGRESS);
 
   // 从游戏页返回时刷新统计，不需要全局状态库
   useFocusEffect(
@@ -43,6 +56,9 @@ export default function HomeScreen() {
       let alive = true;
       void loadHistory().then((list) => {
         if (alive) setStats(summarize(list));
+      });
+      void loadProgress().then((p) => {
+        if (alive) setProg(p);
       });
       return () => {
         alive = false;
@@ -57,6 +73,28 @@ export default function HomeScreen() {
     },
     [router],
   );
+
+  /*
+   * 闯关入口。永远指向「该打的那一题」：已解锁关里第一道没过的题。
+   * 全部通关时才回落到最后一关第 1 题（让玩家还能重打刷星）。
+   */
+  const stage: Stage = STAGES[unlockedStage(prog)];
+  const slot = Math.max(0, nextSlot(prog, stage.index));
+  const stars = totalStars(prog);
+  // 「通关」看的是每关四题都过了，不是满星——满星是刷出来的，不该成为门槛
+  const allCleared = STAGES.every((s) => {
+    const slots = prog.stages[s.index]?.slots ?? [];
+    return slots.length >= SLOTS_PER_STAGE && slots.every((v) => v > 0);
+  });
+  const stageSlots = prog.stages[stage.index]?.slots ?? [];
+
+  const startStage = useCallback(() => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    router.push({
+      pathname: '/play',
+      params: { mode: 'challenge', stage: String(stage.index), slot: String(slot) },
+    });
+  }, [router, stage.index, slot]);
 
   const ready = !!model;
   const statusText = useMemo(() => {
@@ -86,6 +124,38 @@ export default function HomeScreen() {
           <Text style={styles.statusText}>{statusText}</Text>
         </View>
       </View>
+
+      {/* 闯关：这一页最先看到的东西。
+          三个玩法是「规则」，关卡是「下一步」——规则不会让人回来，进度会。 */}
+      <Pressable
+        onPress={startStage}
+        disabled={!ready}
+        style={({ pressed }) => [styles.stageCard, pressed && styles.cardPressed, !ready && styles.cardDisabled]}>
+        <View style={styles.stageTop}>
+          <Text style={styles.stageEyebrow}>
+            {allCleared ? '全部通关' : `第 ${stage.index + 1} 关 · 共 ${STAGES.length} 关`}
+          </Text>
+          <Text style={styles.stageStars}>
+            {stars}
+            <Text style={styles.stageStarsMax}>/{STAGES.length * MAX_STARS_PER_STAGE} ★</Text>
+          </Text>
+        </View>
+        <Text style={styles.stageName}>{stage.name}</Text>
+        <View style={styles.stageSlots}>
+          {Array.from({ length: SLOTS_PER_STAGE }, (_, i) => {
+            const s = stageSlots[i] ?? 0;
+            return (
+              <View
+                key={i}
+                style={[styles.slotDot, s > 0 && styles.slotDotDone, i === slot && s === 0 && styles.slotDotNow]}
+              />
+            );
+          })}
+          <Text style={styles.stageHint}>
+            {allCleared ? '随时回来刷新星数' : `第 ${slot + 1} 题，四题全过解锁下一关`}
+          </Text>
+        </View>
+      </Pressable>
 
       {/* 三种玩法 */}
       <View style={styles.modes}>
@@ -195,6 +265,51 @@ const styles = StyleSheet.create({
   statusText: { color: Palette.inkSoft, fontSize: 11, fontFamily: Typography.mono },
 
   modes: { gap: Space.md },
+
+  stageCard: {
+    backgroundColor: Palette.sealWash,
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: 'rgba(217,66,43,0.22)',
+    padding: Space.lg,
+    marginBottom: Space.lg,
+    gap: Space.xs,
+  },
+  stageTop: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
+  stageEyebrow: {
+    color: Palette.seal,
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    fontFamily: Typography.zh,
+  },
+  stageStars: { color: Palette.seal, fontSize: 14, fontWeight: '700', fontFamily: Typography.mono },
+  stageStarsMax: { color: 'rgba(217,66,43,0.5)', fontSize: 11, fontWeight: '600' },
+  stageName: {
+    color: Palette.ink,
+    fontSize: 26,
+    fontFamily: Typography.title,
+    fontWeight: '700',
+    letterSpacing: -0.4,
+    marginTop: 2,
+  },
+  stageSlots: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: Space.sm },
+  slotDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: 'rgba(217,66,43,0.35)',
+  },
+  slotDotDone: { backgroundColor: Palette.seal, borderColor: Palette.seal },
+  slotDotNow: { backgroundColor: Palette.card, borderColor: Palette.seal, borderWidth: 2 },
+  stageHint: {
+    flex: 1,
+    textAlign: 'right',
+    color: 'rgba(23,22,26,0.5)',
+    fontSize: 11,
+    fontFamily: Typography.zh,
+  },
   card: {
     backgroundColor: Palette.card,
     borderRadius: Radius.lg,

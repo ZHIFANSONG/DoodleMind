@@ -97,6 +97,16 @@ export function useDoodleInfer(model: DoodleModel | null) {
    */
   const nextAtRef = useRef(0);
 
+  /**
+   * 最近一次的推理结果。
+   *
+   * 游戏页需要在**手指停下之后**继续用同一份结果喂判定（否则「画完停手 0.3 秒」
+   * 这种收尾永远判不过——判定只发生在喂结果的那一帧，而喂结果由触摸驱动）。
+   * 这里通过 getLast() 暴露而不是把 probs 塞进 state：多一次 setState 就是
+   * 一次整页重渲染，而调用方只是在定时器里读一下。
+   */
+  const lastRef = useRef<{ probs: Float32Array; ink: number } | null>(null);
+
   const run = useCallback(
     (strokes: Stroke[], force = false): AiResult | null => {
       if (!model || strokes.length === 0) return null;
@@ -127,15 +137,21 @@ export function useDoodleInfer(model: DoodleModel | null) {
       let ink = 0;
       for (let i = 0; i < img.length; i++) ink += img[i];
       lastAtRef.current = t0;
-      return { probs, inferMs, ink: ink / 255 };
+      const result = { probs, inferMs, ink: ink / 255 };
+      // 空画布不留痕：否则擦干净之后定时器还会拿旧概率继续喂判定
+      lastRef.current = result.ink < MIN_INK ? null : { probs, ink: result.ink };
+      return result;
     },
     [model],
   );
 
+  /** 最近一次的有效推理结果，供「停手后继续判」使用 */
+  const getLast = useCallback(() => lastRef.current, []);
+
   /** 没有墨量时清掉跟踪器用的小工具 */
   const isBlank = useCallback((ink: number) => ink < MIN_INK, []);
 
-  return { run, isBlank, lastImage: bufRef };
+  return { run, isBlank, getLast, lastImage: bufRef };
 }
 
 /** 供调试面板显示模型元信息 */

@@ -38,6 +38,8 @@ import { BrushColors, Palette, Radius, Space, Typography } from '@/constants/des
 import { MODES, type Mode, type RoundResult } from '@/lib/modes';
 import { Session, type Snapshot } from '@/lib/session';
 import { appendRecord } from '@/lib/history';
+import { SLOTS_PER_STAGE, STAGES, starsForSlot, wordIndexOf } from '@/lib/campaign';
+import { saveSlot } from '@/lib/progress';
 import { useDoodleInfer, useDoodleModel } from '@/hooks/use-doodle-ai';
 
 type Run = { id: number; target: number; session: Session };
@@ -68,14 +70,31 @@ export default function PlayScreen() {
   useKeepAwake();
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const params = useLocalSearchParams<{ mode?: string }>();
+  const params = useLocalSearchParams<{ mode?: string; stage?: string; slot?: string }>();
   const mode: Mode = (['challenge', 'blind', 'free'] as const).includes(params.mode as Mode)
     ? (params.mode as Mode)
     : 'challenge';
 
+  /*
+   * 闯关不新增玩法，只是在挑战模式上挂两个参数：`stage` / `slot`。
+   *
+   * 这样做的好处是所有胜负规则、判定闸门、计分公式都不必改（它们本来就在测
+   * 「挑战模式」，一改就要给测试也加一层）。关卡需要的只是：目标词固定、
+   * 赢了往前走一格。
+   */
+  const stageIdx = params.stage !== undefined ? Number(params.stage) : -1;
+  const slotIdx = params.slot !== undefined ? Number(params.slot) : -1;
+  const campaign =
+    Number.isInteger(stageIdx) &&
+    stageIdx >= 0 &&
+    stageIdx < STAGES.length &&
+    Number.isInteger(slotIdx) &&
+    slotIdx >= 0 &&
+    slotIdx < SLOTS_PER_STAGE;
+
   const spec = MODES[mode];
   const { model, error, classes } = useDoodleModel();
-  const { run, isBlank } = useDoodleInfer(model);
+  const { run, isBlank, getLast } = useDoodleInfer(model);
   const nClasses = classes.length || 1;
 
   // 当前连赢局数。跨局存活，所以放在页面上而不是 Session 里
@@ -93,13 +112,17 @@ export default function PlayScreen() {
   const makeSession = useCallback(
     (prev?: number): Run => {
       let t = -1;
-      if (spec.needsTarget) {
+      // 闯关题目的目标词是固定好的，不随机
+      const fixed = campaign ? wordIndexOf(stageIdx, slotIdx, classes) : -1;
+      if (fixed >= 0) {
+        t = fixed;
+      } else if (spec.needsTarget) {
         t = Math.floor(Math.random() * nClasses);
         if (prev !== undefined && prev >= 0 && nClasses > 1 && t === prev) t = (t + 1) % nClasses;
       }
       return { id: Math.random(), target: t, session: new Session(mode, t, nClasses, streak) };
     },
-    [mode, nClasses, spec.needsTarget, streak],
+    [mode, nClasses, spec.needsTarget, streak, campaign, stageIdx, slotIdx, classes],
   );
 
   const [current, setCurrent] = useState<Run>(() => makeSession());
@@ -139,6 +162,8 @@ export default function PlayScreen() {
 
   // 结算只允许发生一次：抬手判定和超时判定有可能在同一毫秒撞上
   const [settled, setSettled] = useState(false);
+  // 本局拿到的星数（只有闯关模式有意义）
+  const [campaignStars, setCampaignStars] = useState(0);
 
   /**
    * 落盘 + 触感反馈。
@@ -153,6 +178,12 @@ export default function PlayScreen() {
     (r: RoundResult, drawn: Stroke[]) => {
       setResult(r);
       setSettled(true);
+      // 闯关：过了就记星。只升不降，重打同题打得更差不会把星数改小
+      if (campaign && r.outcome === 'win') {
+        const stars = starsForSlot(r.elapsedMs);
+        setCampaignStars(stars);
+        void saveSlot(stageIdx, slotIdx, stars, r.elapsedMs);
+      }
       // 连击只统计「赢」，且自由模式没有输赢、不该打断连击链
       if (r.outcome === 'win') setStreak((n) => n + 1);
       else if (r.outcome === 'lose') setStreak(0);
@@ -178,7 +209,7 @@ export default function PlayScreen() {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
       }
     },
-    [classes, target, session],
+    [classes, target, session, campaign, stageIdx, slotIdx],
   );
 
   // 计时循环需要读最新的 finish / settled / strokes，但不该因为它们变化就重开定时器
@@ -222,6 +253,26 @@ export default function PlayScreen() {
         liveRef.current.finish(r, liveRef.current.strokes);
         return;
       }
+
+      /*
+       * 停手之后也要继续判。
+       *
+       * 判定只发生在「喂推理结果」的那一帧，而喂推理是由触摸驱动的。于是玩家画完
+       * 最后一笔、手一离开屏幕，就再也不会有新帧——如果那一刻刚好差 0.2 秒没攒满
+       * 保持时长，就永远判不过，看起来像「我明明画完了它不说对」。
+       *
+       * 这里每帧把**最后一次的推理结果**再喂一遍：内容没变，EMA 不变，保持时长
+       * 继续累加，0.38 秒后自然判过。没有额外推理成本（省掉 8ms 的一次前向）。
+       */
+      const judge = getLast();
+      if (s.state === 'playing' && judge) {
+        const r2 = s.feed(judge.probs, now, judge.ink);
+        if (r2 && !liveRef.current.settled) {
+          liveRef.current.finish(r2, liveRef.current.strokes);
+          return;
+        }
+      }
+
       if (s.state === 'playing' && spec.durationMs > 0) timer = setTimeout(tick, 33);
     };
     // 第一次 tick 也走 setTimeout：在 effect 体内同步 setState 会立刻多渲染一帧
@@ -230,7 +281,7 @@ export default function PlayScreen() {
       alive = false;
       if (timer) clearTimeout(timer);
     };
-  }, [current.session, spec.durationMs, pushSnap]);
+  }, [current.session, spec.durationMs, pushSnap, getLast]);
 
   /** 计时从**玩家落第一笔**开始。否则光看题想要画什么，十几秒就没了。 */
   const onStrokeStart = useCallback(() => {
@@ -339,6 +390,49 @@ export default function PlayScreen() {
   const urgent = spec.durationMs > 0 && secs <= 10;
   const playing = session.state === 'playing' || session.state === 'ready';
 
+  /*
+   * 闯关里的「下一题 / 下一关 / 再试一次」全部靠 router.replace 换参数重进页面。
+   *
+   * 不复用 `again()` 的原因：again 只换 Session，不换目标词——而闯关的下一题
+   * 就是换词。重进页面还有个附带好处：画布、笔画、提示、结算状态全部从零开始，
+   * 不需要在 again 里逐项清理（漏清一项就是上一题的墨留在下一题里的 bug）。
+   */
+  const gotoStage = useCallback(
+    (stage: number, slot: number) => {
+      router.replace({
+        pathname: '/play',
+        params: { mode: 'challenge', stage: String(stage), slot: String(slot) },
+      });
+    },
+    [router],
+  );
+
+  const campaignNext = useCallback(() => {
+    if (slotIdx + 1 < SLOTS_PER_STAGE) {
+      gotoStage(stageIdx, slotIdx + 1);
+    } else if (stageIdx + 1 < STAGES.length) {
+      gotoStage(stageIdx + 1, 0);
+    } else {
+      goBack();
+    }
+  }, [gotoStage, goBack, slotIdx, stageIdx]);
+
+  const onAgainPress = campaign
+    ? result?.outcome === 'win'
+      ? campaignNext
+      : () => gotoStage(stageIdx, slotIdx)
+    : again;
+
+  const againLabel = !campaign
+    ? '再来一局'
+    : result?.outcome !== 'win'
+      ? '再试一次'
+      : slotIdx + 1 < SLOTS_PER_STAGE
+        ? '下一题'
+        : stageIdx + 1 < STAGES.length
+          ? '下一关'
+          : '通关了';
+
   /** 正方形画布：取容器宽高的较小值，避免 aspectRatio 在高度不足时溢出 */
   const onBoardLayout = useCallback((e: LayoutChangeEvent) => {
     const { width, height } = e.nativeEvent.layout;
@@ -352,9 +446,14 @@ export default function PlayScreen() {
    */
   const headerOptions = useMemo(
     () => ({
-      title: spec.title,
+      title: campaign ? `${stageIdx + 1} · ${STAGES[stageIdx].name}` : spec.title,
       headerRight: () => (
         <View style={styles.headerRight}>
+          {campaign && (
+            <Text style={styles.stageTag}>
+              {slotIdx + 1}/{SLOTS_PER_STAGE}
+            </Text>
+          )}
           {streak > 1 && <Text style={styles.streakTag}>连胜 {streak}</Text>}
           {spec.durationMs > 0 ? (
             <Text style={[styles.timer, urgent && styles.timerUrgent]}>{secs}</Text>
@@ -364,7 +463,7 @@ export default function PlayScreen() {
         </View>
       ),
     }),
-    [spec.title, spec.durationMs, streak, secs, urgent],
+    [spec.title, spec.durationMs, streak, secs, urgent, campaign, stageIdx, slotIdx],
   );
 
   return (
@@ -542,7 +641,9 @@ export default function PlayScreen() {
         <ResultCard
           result={result}
           word={targetClass ? `${targetClass.emoji} ${targetClass.zh}` : '自由画'}
-          onAgain={again}
+          stars={campaign && result.outcome === 'win' ? campaignStars : 0}
+          againLabel={againLabel}
+          onAgain={onAgainPress}
           onHome={goBack}
         />
       )}
@@ -575,11 +676,16 @@ function ToolButton({
 function ResultCard({
   result,
   word,
+  stars = 0,
+  againLabel = '再来一局',
   onAgain,
   onHome,
 }: {
   result: RoundResult;
   word: string;
+  /** 闯关拿到的星数；0 表示这不是闯关过关，不显示星级 */
+  stars?: number;
+  againLabel?: string;
   onAgain: () => void;
   onHome: () => void;
 }) {
@@ -612,6 +718,12 @@ function ResultCard({
         </View>
         <Text style={styles.resultTitle}>{result.headline}</Text>
         <Text style={styles.resultWord}>{word}</Text>
+        {stars > 0 && (
+          <Text style={styles.resultStars}>
+            {'★'.repeat(stars)}
+            <Text style={styles.resultStarsDim}>{'★'.repeat(3 - stars)}</Text>
+          </Text>
+        )}
         <Text style={styles.resultDetail}>{result.detail}</Text>
         {result.score > 0 && <Text style={styles.resultScore}>+{result.score}</Text>}
         <View style={styles.resultBtns}>
@@ -623,7 +735,7 @@ function ResultCard({
           <Pressable
             onPress={onAgain}
             style={({ pressed }) => [styles.solidBtn, pressed && { opacity: 0.85 }]}>
-            <Text style={styles.solidBtnText}>再来一局</Text>
+            <Text style={styles.solidBtnText}>{againLabel}</Text>
           </Pressable>
         </View>
       </Animated.View>
@@ -636,6 +748,19 @@ const styles = StyleSheet.create({
 
   // 导航栏右侧：倒计时与连击。系统 bar button 只有 44pt 高，元素都压得很小
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  stageTag: {
+    color: Palette.inkSoft,
+    fontSize: 11,
+    fontFamily: Typography.mono,
+    fontWeight: '600',
+  },
+  resultStars: {
+    fontSize: 19,
+    letterSpacing: 2,
+    color: Palette.seal,
+    marginTop: 2,
+  },
+  resultStarsDim: { color: Palette.rule },
   streakTag: {
     color: Palette.seal,
     fontSize: 10.5,

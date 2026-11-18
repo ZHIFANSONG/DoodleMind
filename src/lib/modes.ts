@@ -25,6 +25,15 @@ export type ModeSpec = {
   needsTarget: boolean;
   /** 判定通过的概率阈值 */
   passThreshold: number;
+  /**
+   * 允许的最高排名（0 = 必须是第一名）。
+   *
+   * 挑战模式给到 1：真人画出来的东西和 QuickDraw 差得远，模型经常把太阳看成
+   * 海龟——「它第二个想到的就是你画的」也算认出来了，否则玩家会觉得「明明画对
+   * 了却不给过」。盲区模式必须是 0：那里的「被看穿」得是它的确信心，宽松了
+   * 反而让玩家无辜输掉。
+   */
+  passRank: number;
   /** 需要连续保持的毫秒数 */
   holdMs: number;
   /** 需要的最少墨量（防止空画布白嫖），单位是等效满墨像素数 */
@@ -39,12 +48,13 @@ export const MODES: Record<Mode, ModeSpec> = {
     tagline: '让它猜出你画的词',
     rules: [
       '屏幕给你一个词，你把它画出来',
-      '模型的目标概率进入第一名并稳定 0.38 秒，就算它说对了',
+      '模型的目标概率进入前二名并稳定 0.38 秒，就算它说对了',
       '60 秒内没让它说对，这局算输',
     ],
     durationMs: 60_000,
     needsTarget: true,
-    passThreshold: 0.42,
+    passThreshold: 0.3,
+    passRank: 1,
     holdMs: 380,
     minInk: 0,
     glyph: 'pencil',
@@ -63,6 +73,7 @@ export const MODES: Record<Mode, ModeSpec> = {
     durationMs: 40_000,
     needsTarget: true,
     passThreshold: 0.42,
+    passRank: 0,
     holdMs: 120,
     /** 约等于「画完一个完整轮廓」的墨量。一条贯穿的粗线是 55，一只猫是 187 */
     minInk: 90,
@@ -80,6 +91,7 @@ export const MODES: Record<Mode, ModeSpec> = {
     durationMs: 0,
     needsTarget: false,
     passThreshold: 0,
+    passRank: 0,
     holdMs: 0,
     minInk: 0,
     glyph: 'scribble',

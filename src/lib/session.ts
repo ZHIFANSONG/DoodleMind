@@ -103,7 +103,7 @@ export class Session {
     const spec = this.spec;
     const p = this.tracker.pOf(this.target);
     const rank = this.tracker.rankOf(this.target);
-    const hit = rank === 0 && p >= spec.passThreshold;
+    const hit = rank <= spec.passRank && p >= spec.passThreshold;
 
     if (this.mode === 'challenge') {
       if (hit) {
