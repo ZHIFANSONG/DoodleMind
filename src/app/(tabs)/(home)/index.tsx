@@ -215,7 +215,7 @@ export default function HomeScreen() {
       )}
 
       <Text style={styles.footnote}>
-        完全离线 · 无网络权限 · 模型 236 KB · 数据来自 Google QuickDraw（CC BY 4.0）
+        完全离线 · 无网络权限 · 模型 {Math.round(info.bytes / 1024)} KB · 数据来自 Google QuickDraw（CC BY 4.0）
       </Text>
     </ScrollView>
   );
