@@ -406,8 +406,20 @@ git tag v1.0.0 && git push origin v1.0.0
 **五、结构校验的判据只能管「自己产出的文件」。**
 一开始写的是「包内不得出现 `/Users/runner`」，结果 ipa 里 `hermesvm` / `React` / `ReactNativeDependencies` / `ExpoModulesJSI` 这些**第三方预编译框架**自带构建机路径，本工程改不掉。而且那只是 CI 的目录，不含任何个人信息。现在硬性判据只留 `main.jsbundle` 与 `Info.plist`，其余列出来但当信息看。
 
-**六、抹路径要抹在打包之前，不能抹在校验步骤里。**
-`main.jsbundle` 里有 Metro 记下的绝对路径（`/Users/runner/work/.../Build/Products/Release-iphoneos/...`）。我第一版把替换写在 workflow 的「校验」步里——那一步是对**已经打好的 ipa 解包后的副本**动手，校验愉快地通过了，但发出去的包里原样还在。现在放在 `scripts/build-ipa.sh` 里、`zip` 之前。
+**六、（最贵的一次）`main.jsbundle` 是 Hermes 字节码，一个字节都改不得。**
+它里面有 Metro 记下的一条绝对路径（`/Users/runner/work/.../Build/Products/Release-iphoneos/...`）。我把它当文本，做了一次字节替换想把路径抹掉——`/Users/runner/work/DoodleMind/DoodleMind`（39 字符）换成 `/DoodleMind`（10 字符）。
+
+结果：**文件少了 29 字节，头里还写着旧长度，App 装到手机上启动即闪退**。没有白屏、没有报错页，就是点了图标立刻退。而 `unzip -l`、`plutil -p`、`grep` 这些静态检查当时全是绿的——我甚至用 `Get-Content -Raw` 读过它、grep 得到内容，因为它看起来就是个文本文件。
+
+现在校验步骤里有硬性一条：
+
+```python
+magic = struct.unpack_from('<I', d, 0)[0]      # 必须是 0x03BC1FC6
+declared = struct.unpack_from('<I', d, 32)[0]  # HBC 头里写着文件自身长度
+assert declared == len(d)
+```
+
+这条检查用当时那个坏包试过，会准确报「差 29 字节」。构建机路径就留着吧——`/Users/runner` 是 CI 的临时目录，不含任何个人信息，为了抹它弄坏一个包不值得。
 
 ---
 

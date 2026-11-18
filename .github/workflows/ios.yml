@@ -108,48 +108,46 @@ jobs:
         run: |
           set -euo pipefail
           cd ios
-          # 注意不要写成 `unzip -l ... | head -20`：head 提前关管道会给 unzip 发
-          # SIGPIPE，在 `set -o pipefail` 下这一步直接判失败。先落文件再截取。
+          # 注意不要写 `unzip -l ... | head -20`：head 读完就关管道，unzip 收
+          # SIGPIPE，在 `set -o pipefail` 下这一步直接判失败。重定向到文件再截取。
           unzip -l DoodleMind-unsigned.ipa > ipa-list.txt
           sed -n '1,15p' ipa-list.txt
           rm -rf check
           unzip -q DoodleMind-unsigned.ipa -d check
           appdir=$(find check/Payload -maxdepth 1 -name '*.app' | head -1)
           test -n "$appdir" || { echo "没有 Payload/*.app"; exit 1; }
-          # 未签名包不该带 _CodeSignature
-          if find check -name '_CodeSignature' | grep -q .; then echo "残留签名目录"; exit 1; fi
-          plutil -p "$appdir/Info.plist" | grep -E 'CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion'
-          # 抹掉 JS bundle 里的构建机路径。bundle 是纯文本，替换前缀不会破坏任何
-          # 偏移；不抹的话包里会有 /Users/runner/work/DoodleMind/DoodleMind/...
-          # 这类 Metro 记录下来的绝对路径。
-          python3 - "$appdir/main.jsbundle" <<'PY'
-          import sys, os
-          p = sys.argv[1]
-          if not os.path.exists(p):
-              print("没有 main.jsbundle，跳过")
-              sys.exit(0)
-          d = open(p, 'rb').read()
-          n = d.count(b'/Users/runner')
-          if n:
-              d = d.replace(b'/Users/runner/work/DoodleMind/DoodleMind', b'/DoodleMind')
-              d = d.replace(b'/Users/runner', b'/runner')
-              open(p, 'wb').write(d)
-          print(f"main.jsbundle: 抹掉 {n} 处构建机路径")
-          PY
-          # 只对**我们自己能控制的东西**硬性要求干净：JS bundle 与 Info.plist。
-          # 第三方预编译框架（hermes / React / RN deps / ExpoModulesJSI）里带
-          # 构建机路径是上游产物自带的，本工程改不掉；而且那只是 /Users/runner
-          # 这种 CI 目录，不涉及任何个人信息。这里列出来但不判失败。
-          leak=""
-          for f in "$appdir/main.jsbundle" "$appdir/Info.plist"; do
-            if [ -f "$f" ] && grep -q "/Users/runner" "$f" 2>/dev/null; then leak="$leak $f"; fi
-          done
-          if [ -n "$leak" ]; then
-            echo "这些我们自己产出的文件里还留着构建机路径：$leak"
-            exit 1
+          if find check -name '_CodeSignature' | grep -q .; then
+            echo "残留签名目录"; exit 1
           fi
-          echo "── 以下第三方预编译产物自带构建机路径（不影响安装）──"
-          grep -rl "/Users/runner" check/Payload 2>/dev/null | sed -n '1,20p' || true
+          plutil -p "$appdir/Info.plist" | grep -E 'CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion'
+
+          # 这条检查比任何"好看"的检查都重要。
+          #
+          # release 的 main.jsbundle 是 Hermes 字节码，偏移 32 处是一个 u32
+          # 写着**文件自身的长度**。我曾在 bundle 上做字节替换去抹构建机路径
+          # （纯文本替换，看起来完全无害），结果把字符串表弄坏了：文件少了
+          # 29 字节，头里仍写着旧长度，App 装到手机上启动即闪退——而 unzip、
+          # plutil、grep 这些静态检查全绿。所以必须验"头里声明的长度 == 实际长度"。
+          python3 - "$appdir/main.jsbundle" <<'PY'
+          import struct, sys
+          p = sys.argv[1]
+          d = open(p, 'rb').read()
+          magic = struct.unpack_from('<I', d, 0)[0]
+          if magic != 0x03BC1FC6:
+              sys.exit(f"main.jsbundle 不是 Hermes 字节码（magic={magic:08x}）")
+          ver = struct.unpack_from('<I', d, 8)[0]
+          declared = struct.unpack_from('<I', d, 32)[0]
+          print(f"main.jsbundle: Hermes v{ver}, 头声明 {declared} 字节, 实际 {len(d)} 字节")
+          if declared != len(d):
+              sys.exit(f"bundle 已损坏：头里 {declared} 与实际 {len(d)} 差 {declared - len(d)} 字节")
+          PY
+
+          # 构建机路径只当信息看。main.jsbundle 是**二进制**，一个字节都改不得；
+          # 而 hermes / React / ReactNativeDependencies / ExpoModulesJSI 这些
+          # 第三方预编译产物自带路径，本工程改不掉。它们都只是 /Users/runner
+          # 这类 CI 临时目录，不含任何个人信息。
+          echo "── 以下文件含构建机路径（仅 CI 目录，不影响安装）──"
+          { grep -rl "/Users/runner" check/Payload 2>/dev/null || true; } | sed -n '1,20p'
           echo "结构校验通过"
 
       - uses: actions/upload-artifact@v4

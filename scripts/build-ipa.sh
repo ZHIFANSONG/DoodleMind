@@ -170,27 +170,18 @@ exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
 xcrun strip -S -x "$app/$exe"
 find "$app" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
 
-# 抹掉 JS bundle 里的构建机路径。这里**必须**在打包之前做：Metro 会把
-# 资源与模块的绝对路径写进 bundle（`/Users/runner/work/.../Build/Products/
-# Release-iphoneos/DoodleMind.app/...`）。bundle 是纯文本，替换前缀不会破坏
-# 任何偏移。
+# ⚠️ 千万不要对 main.jsbundle 做字节替换。
 #
-# 注意别只在 workflow 的「校验」步骤里抹——那一步是对已经打好的 ipa 解包后
-# 的副本动手，校验能过，但发出去的包里原样还在（踩过一次）。
-python3 - "$app/main.jsbundle" <<'PY'
-import os, sys
-p = sys.argv[1]
-if not os.path.exists(p):
-    print("没有 main.jsbundle，跳过")
-    raise SystemExit(0)
-d = open(p, 'rb').read()
-n = d.count(b'/Users/runner')
-if n:
-    d = d.replace(b'/Users/runner/work/DoodleMind/DoodleMind', b'/DoodleMind')
-    d = d.replace(b'/Users/runner', b'/runner')
-    open(p, 'wb').write(d)
-print(f"main.jsbundle: 抹掉 {n} 处构建机路径")
-PY
+# 我在这里踩过一次，代价是一个装机即闪退的版本：release 构建出的
+# main.jsbundle 是 **Hermes 字节码**（开头 c6 1f bc 03），不是文本。它的字符串
+# 表里长度/偏移是写死在字节里的，把 `/Users/runner/work/DoodleMind/DoodleMind`
+# 换成更短的 `/DoodleMind` 之后文件仍然"看起来"正常——甚至 grep 得到、能列大小
+# ——但 JS 引擎加载时会因为表对不上而直接失败，App 启动瞬间退出，没有任何界面
+# 提示，也没法从日志看出是 bundle 坏了。
+#
+# 它里面确实会带一条 `/Users/runner/work/.../Build/Products/Release-iphoneos/
+# DoodleMind.app/...` 的路径（Metro 记下来的），但那是 CI 的临时目录，不含任何
+# 个人信息，留着没有实际风险。结构校验那边把它当信息看，不判失败。
 
 rm -rf Payload DoodleMind-unsigned.ipa
 mkdir Payload
