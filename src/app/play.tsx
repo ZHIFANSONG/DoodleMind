@@ -40,6 +40,7 @@ import { Session, type Snapshot } from '@/lib/session';
 import { appendRecord } from '@/lib/history';
 import { SLOTS_PER_STAGE, STAGES, starsForSlot, wordIndexOf } from '@/lib/campaign';
 import { saveSlot } from '@/lib/progress';
+import { playSfx } from '@/lib/sfx';
 import { useDoodleInfer, useDoodleModel } from '@/hooks/use-doodle-ai';
 
 type Run = { id: number; target: number; session: Session };
@@ -203,8 +204,10 @@ export default function PlayScreen() {
       });
       if (r.outcome === 'win') {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        playSfx('stamp');
       } else if (r.outcome === 'lose') {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        playSfx('nope');
       } else {
         void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
       }
