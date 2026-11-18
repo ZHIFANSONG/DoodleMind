@@ -53,9 +53,17 @@ export default function RootLayout() {
           headerBackTitle: '回去',
         }}>
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        {/*
+          `gestureEnabled: false` 是必须的，不是偏好。
+
+          这一屏整块都是画布：手指从左边缘往里划是在画线，系统却把它当成
+          「返回上一页」的交互式转场——两条手势抢同一次触摸，结果是画到一半
+          被推出这一局，而且越靠左画越容易被抢走。iOS 自己的画图类 App 也都
+          关掉这个手势，退出走导航栏左上角的返回按钮（系统那个 chevron + 回去）。
+        */}
         <Stack.Screen
           name="play"
-          options={{ animation: 'slide_from_bottom', gestureEnabled: true }}
+          options={{ animation: 'slide_from_bottom', gestureEnabled: false }}
         />
       </Stack>
     </ThemeProvider>

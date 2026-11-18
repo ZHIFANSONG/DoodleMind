@@ -42,6 +42,28 @@ import { useDoodleInfer, useDoodleModel } from '@/hooks/use-doodle-ai';
 
 type Run = { id: number; target: number; session: Session };
 
+/**
+ * 两份快照在**屏幕上**看起来是否一样。用来挡掉「数据变了但画面上什么都不会变」
+ * 的重渲染——计时循环每秒试 30 次，挡掉之后实际只在跨整秒、跨整百分点时才渲染。
+ *
+ * 注意比较的是显示精度（百分比、整秒），不是原始浮点：`closeness` 每帧都在动，
+ * 按原值比等于没比。
+ */
+function sameView(a: Snapshot, b: Snapshot): boolean {
+  if (a.state !== b.state || a.rank !== b.rank || a.danger !== b.danger) return false;
+  if (Math.round(a.closeness * 100) !== Math.round(b.closeness * 100)) return false;
+  if (Math.round(a.holdRatio * 100) !== Math.round(b.holdRatio * 100)) return false;
+  if (Math.ceil(a.remainMs / 1000) !== Math.ceil(b.remainMs / 1000)) return false;
+  if (Math.floor(a.elapsedMs / 1000) !== Math.floor(b.elapsedMs / 1000)) return false;
+  if (a.guesses.length !== b.guesses.length) return false;
+  for (let i = 0; i < a.guesses.length; i++) {
+    const x = a.guesses[i];
+    const y = b.guesses[i];
+    if (x.index !== y.index || Math.round(x.p * 100) !== Math.round(y.p * 100)) return false;
+  }
+  return true;
+}
+
 export default function PlayScreen() {
   useKeepAwake();
   const insets = useSafeAreaInsets();
@@ -86,6 +108,21 @@ export default function PlayScreen() {
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [color, setColor] = useState<string>(BrushColors[0]);
   const [snap, setSnap] = useState<Snapshot>(() => session.snapshot(Date.now()));
+  const lastSnapRef = useRef<Snapshot | null>(null);
+  /**
+   * 只有**看见的东西**变了才 setState。
+   *
+   * 计时循环每 33ms 取一次快照，而快照每次都是新对象——直接 setSnapshot 等于
+   * 一秒重渲染 30 次整页（含导航栏、SwiftUI Host 里的 Gauge、毛玻璃候选栏）。
+   * 而真正会变的只有：还剩几秒、置信度百分比、排名、保持进度条、候选词。
+   * 把这些按显示精度取整后比较，落在整秒/整百分点之间的帧直接丢掉。
+   */
+  const pushSnap = useCallback((next: Snapshot) => {
+    const last = lastSnapRef.current;
+    if (last && sameView(last, next)) return;
+    lastSnapRef.current = next;
+    setSnap(next);
+  }, []);
   const [inferMs, setInferMs] = useState(0);
   const [ink, setInk] = useState(0);
   /**
@@ -180,7 +217,7 @@ export default function PlayScreen() {
       const now = Date.now();
       const r = s.tick(now);
       const st = s.snapshot(now);
-      setSnap(st);
+      pushSnap(st);
       if (r && !liveRef.current.settled) {
         liveRef.current.finish(r, liveRef.current.strokes);
         return;
@@ -193,7 +230,7 @@ export default function PlayScreen() {
       alive = false;
       if (timer) clearTimeout(timer);
     };
-  }, [current.session, spec.durationMs]);
+  }, [current.session, spec.durationMs, pushSnap]);
 
   /** 计时从**玩家落第一笔**开始。否则光看题想要画什么，十几秒就没了。 */
   const onStrokeStart = useCallback(() => {
@@ -211,17 +248,17 @@ export default function PlayScreen() {
         // 擦干净了：把跟踪器清空，别让上一笔的残留判断留在候选栏
         // （阈值统一走 hook 导出的 isBlank，避免这里再写一个魔数）
         session.tracker.reset();
-        setSnap(session.snapshot(Date.now()));
+        pushSnap(session.snapshot(Date.now()));
         return;
       }
       const now = Date.now();
       session.start(now);
       const r = session.feed(res.probs, now, res.ink);
-      setSnap(session.snapshot(now));
+      pushSnap(session.snapshot(now));
       // 把**这一笔已经算进去的** next 传下去，而不是闭包里那份缺一笔的 strokes
       if (r) finish(r, next);
     },
-    [run, session, finish, isBlank],
+    [run, session, finish, isBlank, pushSnap],
   );
 
   const onStrokeEnd = useCallback(
@@ -257,8 +294,8 @@ export default function PlayScreen() {
     setStrokes([]);
     setInk(0);
     session.tracker.reset();
-    setSnap(session.snapshot(Date.now()));
-  }, [session]);
+    pushSnap(session.snapshot(Date.now()));
+  }, [session, pushSnap]);
 
   /**
    * 回上一页。深链直达 `/play` 时（或者 web 上刷新过页面）导航栈是空的，
@@ -293,8 +330,8 @@ export default function PlayScreen() {
     setHint(null);
     const ns = makeSession(target);
     setCurrent(ns);
-    setSnap(ns.session.snapshot(Date.now()));
-  }, [makeSession, target]);
+    pushSnap(ns.session.snapshot(Date.now()));
+  }, [makeSession, target, pushSnap]);
 
   const guesses = useMemo(() => snap.guesses.filter((g) => g.p > 0.006), [snap.guesses]);
   const targetClass = target >= 0 ? classes[target] : null;
@@ -308,6 +345,28 @@ export default function PlayScreen() {
     setBoard(Math.floor(Math.min(width, height)));
   }, []);
 
+  /**
+   * 导航栏选项必须 memo。每次渲染都传一个新对象进去，React Navigation 会认为
+   * 配置变了、把更新推给原生 UINavigationBar——而这一页的倒计时每秒只该改一次，
+   * 之前却是每次重渲染都推一遍，正在画线时尤其明显。
+   */
+  const headerOptions = useMemo(
+    () => ({
+      title: spec.title,
+      headerRight: () => (
+        <View style={styles.headerRight}>
+          {streak > 1 && <Text style={styles.streakTag}>连胜 {streak}</Text>}
+          {spec.durationMs > 0 ? (
+            <Text style={[styles.timer, urgent && styles.timerUrgent]}>{secs}</Text>
+          ) : (
+            <Text style={styles.freeTag}>自由</Text>
+          )}
+        </View>
+      ),
+    }),
+    [spec.title, spec.durationMs, streak, secs, urgent],
+  );
+
   return (
     <View style={styles.root}>
       {/*
@@ -317,21 +376,7 @@ export default function PlayScreen() {
         右侧的倒计时用 `headerRight`，系统会把它当成一个 bar button 处理，
         动态字体、VoiceOver 顺序都会自动正确。
       */}
-      <Stack.Screen
-        options={{
-          title: spec.title,
-          headerRight: () => (
-            <View style={styles.headerRight}>
-              {streak > 1 && <Text style={styles.streakTag}>连胜 {streak}</Text>}
-              {spec.durationMs > 0 ? (
-                <Text style={[styles.timer, urgent && styles.timerUrgent]}>{secs}</Text>
-              ) : (
-                <Text style={styles.freeTag}>自由</Text>
-              )}
-            </View>
-          ),
-        }}
-      />
+      <Stack.Screen options={headerOptions} />
 
       {/* 题目卡 */}
       <View style={[styles.promptCard, mode === 'blind' && styles.promptCardBlind]}>
