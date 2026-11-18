@@ -75,11 +75,12 @@ jobs:
           npx tsc --noEmit
           npx eslint src
 
-      # 三道纯逻辑闸门不依赖 Xcode，先跑：模型没导出好就不该浪费 20 分钟编译
-      - name: 推理 / 栅格化 / 状态机闸门
+      # 四道纯逻辑闸门不依赖 Xcode，先跑：模型没导出好就不该浪费 20 分钟编译
+      - name: 推理 / 栅格化 / 梯度 / 状态机闸门
         run: |
           node tools/check-raster.mjs
           node tools/check-engine.mjs
+          node tools/check-grad.mjs
           node tools/check-game.mjs
 
       # Expo 用 CNG（Continuous Native Generation）：仓库里没有 ios/，

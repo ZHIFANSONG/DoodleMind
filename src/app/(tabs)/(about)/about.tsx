@@ -15,6 +15,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useScreenTop } from '@/hooks/use-screen-top';
 import { Glyph } from '@/components/glyph';
 import { Bar, SpecPanel } from '@/components/native/kit';
+import { ClassMap } from '@/components/class-map';
 
 import DrawingCanvas, { type Stroke } from '@/components/drawing-canvas';
 import { BrushColors, Palette, Radius, Space, Typography } from '@/constants/design';
@@ -176,6 +177,23 @@ export default function AboutScreen() {
         )}
       </Section>
 
+      {/* 它眼里的世界 */}
+      <Section title="它把哪些词搞混">
+        <Text style={styles.sectionNote}>
+          每类留 24 张样本跑一遍，看它平均会猜成什么；最容易混的三条连成线，再用力导向布局把有瓜葛的词拉到一起。
+          所以挨着就代表它真的认错过。上面画的时候，它的前几名会在这里亮起来。
+        </Text>
+        {board > 0 && (
+          <ClassMap size={board} highlight={top.slice(0, 3).map((t) => t.index)} />
+        )}
+        <Text style={styles.sectionNote}>
+          这张图解释了两件事：为什么画猫会被认成老虎（同一簇），以及它其实没有「类别相似」的概念——
+          只有「这团像素长得像哪一类的训练样本」。坐标由
+          <Text style={styles.code}> tools/make_classmap.py </Text>
+          离线算好，端上只画线画点。
+        </Text>
+      </Section>
+
       {/* 设计取舍 */}
       <Section title="为什么这么做">
         <Note
@@ -299,6 +317,7 @@ const styles = StyleSheet.create({
     gap: Space.xs,
   },
   sectionNote: { color: Palette.inkFaint, fontSize: 11.5, lineHeight: 17, fontFamily: Typography.zh },
+  code: { fontFamily: Typography.mono, fontSize: 11 },
 
   board: {
     aspectRatio: 1,

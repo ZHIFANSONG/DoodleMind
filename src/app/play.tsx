@@ -34,6 +34,7 @@ import { Glass } from '@/components/glass';
 import { PlayMeter } from '@/components/play-meter';
 
 import DrawingCanvas, { type Stroke } from '@/components/drawing-canvas';
+import { SaliencyOverlay } from '@/components/saliency-overlay';
 import { BrushColors, Palette, Radius, Space, Typography } from '@/constants/design';
 import { MODES, type Mode, type RoundResult } from '@/lib/modes';
 import { Session, type Snapshot } from '@/lib/session';
@@ -95,7 +96,7 @@ export default function PlayScreen() {
 
   const spec = MODES[mode];
   const { model, error, classes } = useDoodleModel();
-  const { run, isBlank, getLast } = useDoodleInfer(model);
+  const { run, isBlank, getLast, heat } = useDoodleInfer(model);
   const nClasses = classes.length || 1;
 
   // 当前连赢局数。跨局存活，所以放在页面上而不是 Session 里
@@ -160,6 +161,18 @@ export default function PlayScreen() {
   const [result, setResult] = useState<RoundResult | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [board, setBoard] = useState(0);
+  /**
+   * X-Ray 开关 + 当前热力图。
+   *
+   * 热力图算的是「对当前 top-1 那一类的敏感度」——也就是"它这么想，是因为看了
+   * 你画的哪一块"。这是玩家唯一能问出的、有答案的问题：问"为什么不是太阳"要
+   * 对每一类都算一遍，而屏幕上显眼的就是它的结论。
+   *
+   * `heat()` 内部节流 180ms 且返回**同一块缓冲**，所以这里必须 clone 一份再
+   * setState——同一引用 React 认为没变，热力图就再也不刷新了。
+   */
+  const [xray, setXray] = useState(false);
+  const [heatMap, setHeatMap] = useState<Float32Array | null>(null);
 
   // 结算只允许发生一次：抬手判定和超时判定有可能在同一毫秒撞上
   const [settled, setSettled] = useState(false);
@@ -227,6 +240,24 @@ export default function PlayScreen() {
   useEffect(() => {
     liveRef.current = { finish, settled, strokes };
   });
+
+  /**
+   * X-Ray 开关的镜像。放 ref 而不是加进 `applyResult` 的依赖数组：那个回调被
+   * 触摸事件链引用着，为了一次开关去重建整条链不值得；而且它在事件回调里被读，
+   * 不在渲染期，用 ref 完全合法。
+   */
+  const xrayRef = useRef(xray);
+  useEffect(() => {
+    xrayRef.current = xray;
+  }, [xray]);
+
+  /** 开关动作。关掉时顺手清空热力图——不然下次开启会先闪一下上一局的残留。 */
+  const toggleXray = useCallback(() => {
+    const next = !xrayRef.current;
+    xrayRef.current = next;
+    setXray(next);
+    if (!next) setHeatMap(null);
+  }, []);
 
   useEffect(() => {
     const s = current.session;
@@ -309,10 +340,17 @@ export default function PlayScreen() {
       session.start(now);
       const r = session.feed(res.probs, now, res.ink);
       pushSnap(session.snapshot(now));
+      // X-Ray：解释它自己的结论（top-1），不是解释"为什么不是目标词"
+      if (xrayRef.current) {
+        let top = 0;
+        for (let i = 1; i < res.probs.length; i++) if (res.probs[i] > res.probs[top]) top = i;
+        const h = heat(top);
+        if (h) setHeatMap(new Float32Array(h));
+      }
       // 把**这一笔已经算进去的** next 传下去，而不是闭包里那份缺一笔的 strokes
       if (r) finish(r, next);
     },
-    [run, session, finish, isBlank, pushSnap],
+    [run, session, finish, isBlank, pushSnap, heat],
   );
 
   const onStrokeEnd = useCallback(
@@ -347,6 +385,7 @@ export default function PlayScreen() {
   const clearAll = useCallback(() => {
     setStrokes([]);
     setInk(0);
+    setHeatMap(null);
     session.tracker.reset();
     pushSnap(session.snapshot(Date.now()));
   }, [session, pushSnap]);
@@ -543,6 +582,8 @@ export default function PlayScreen() {
               onStrokeEnd={onStrokeEnd}
               onPoint={onPoint}
             />
+            {/* X-Ray：它此刻在看画面的哪一块（∂logit/∂像素，已验证与 autograd 逐位一致） */}
+            {xray && <SaliencyOverlay map={heatMap} size={board} />}
           </View>
         )}
         {!model && !error && <Text style={styles.hintOverlay}>正在唤醒模型…</Text>}
@@ -566,12 +607,26 @@ export default function PlayScreen() {
         <View style={styles.guessHeader}>
           <Text style={styles.guessTitle}>
             {mode === 'blind' ? '它在想（别让它中）' : '它在想'}
+            {xray ? ' · 红色是它在看的' : ''}
           </Text>
-          <Text style={styles.guessMeta}>
-            {inferMs > 0 ? `${inferMs}ms` : '—'}
-            {/* 没落笔时追踪器全零，rank 只是个任意的序号，报出来会误导 */}
-            {mode !== 'free' && snap.rank >= 0 && strokes.length > 0 ? ` · 第${snap.rank + 1}位` : ''}
-          </Text>
+          <View style={styles.guessMetaRow}>
+            <Text style={styles.guessMeta}>
+              {inferMs > 0 ? `${inferMs}ms` : '—'}
+              {/* 没落笔时追踪器全零，rank 只是个任意的序号，报出来会误导 */}
+              {mode !== 'free' && snap.rank >= 0 && strokes.length > 0 ? ` · 第${snap.rank + 1}位` : ''}
+            </Text>
+            {/*
+              X-Ray 开关。放在这一行而不是工具栏：工具栏是"画"的操作，这里是"看它"的
+              操作，语义上和「它在想」是一族的。开启后每次推理顺带算一次输入梯度
+              （约 20ms，内部再节流到 180ms），画布上叠一层热区。
+            */}
+            <Pressable
+              onPress={toggleXray}
+              hitSlop={8}
+              style={[styles.xrayBtn, xray && styles.xrayBtnOn]}>
+              <Text style={[styles.xrayText, xray && styles.xrayTextOn]}>X 光</Text>
+            </Pressable>
+          </View>
         </View>
         <ScrollView
           horizontal
@@ -860,6 +915,17 @@ const styles = StyleSheet.create({
   },
   guessTitle: { color: Palette.inkSoft, fontSize: 11.5, fontFamily: Typography.zh, fontWeight: '600' },
   guessMeta: { color: Palette.inkFaint, fontSize: 10.5, fontFamily: Typography.mono },
+  guessMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  xrayBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: Radius.pill,
+    borderWidth: 1,
+    borderColor: Palette.rule,
+  },
+  xrayBtnOn: { backgroundColor: Palette.sealWash, borderColor: Palette.seal },
+  xrayText: { color: Palette.inkFaint, fontSize: 10, fontFamily: Typography.zh, fontWeight: '600' },
+  xrayTextOn: { color: Palette.seal },
   guessRow: { gap: 7, paddingHorizontal: Space.md, paddingVertical: Space.sm, alignItems: 'center' },
   guessEmpty: { color: Palette.inkFaint, fontSize: 11.5, fontFamily: Typography.zh, paddingVertical: 12 },
   chip: {

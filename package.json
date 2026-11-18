@@ -41,7 +41,8 @@
     "check:raster": "node tools/check-raster.mjs",
     "check:engine": "node tools/check-engine.mjs",
     "check:game": "node tools/check-game.mjs",
-    "check": "node tools/check-raster.mjs && node tools/check-engine.mjs && node tools/check-game.mjs"
+    "check:grad": "node tools/check-grad.mjs",
+    "check": "node tools/check-raster.mjs && node tools/check-engine.mjs && node tools/check-grad.mjs && node tools/check-game.mjs"
   },
   "private": true
 }

@@ -36,6 +36,17 @@ export type DoodleModel = {
   predict(img: Uint8Array, size: number): Float32Array;
   /** top-k 结果，按概率降序 */
   topK(img: Uint8Array, size: number, k: number): { index: number; p: number }[];
+  /**
+   * 反向传播：∂logit[classIndex] / ∂(归一化后的输入)。长度 size*size。
+   *
+   * 这是整份引擎里唯一需要「梯度」的地方——有了它才能回答两个问题：
+   *   1. 它到底在看画面的哪一块（显著性热力图）
+   *   2. 往哪里再加一笔最能让它改主意（梯度引导）
+   * 一次约 12~18ms，是 forward 的两倍，所以只在开 X-Ray 时才跑。
+   */
+  gradInput(img: Uint8Array, size: number, classIndex: number): Float32Array | null;
+  /** 内部用：对归一化输入（0..1）做 forward，供梯度校验脚本做有限差分 */
+  forwardNormalized(x: Float32Array, size: number): Float32Array;
 };
 
 type OpType = 0 | 1 | 2; // 0=dense3x3  1=depthwise3x3  2=pointwise1x1
@@ -471,15 +482,9 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
     return [oh, ow];
   }
 
-  function predict(img: Uint8Array, size: number): Float32Array {
-    const logits = new Float32Array(nClasses);
-    if (size !== 32) throw new Error(`输入尺寸必须是 32，收到 ${size}`);
-
-    // 输入归一化到 [0,1]
-    const total = size * size;
-    let cur = bufA;
-    for (let i = 0; i < total; i++) cur[i] = img[i] / 255;
-
+  /** 一次 forward（输入已是 0..1）；把 logits 写进出参，中间结果散在 bufA/bufB */
+  function runForward(cur0: Float32Array, size: number, logits: Float32Array): void {
+    let cur = cur0;
     let c = 1;
     let h = size;
     let wd = size;
@@ -502,7 +507,6 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
       }
     }
 
-    // GAP
     const area = h * wd;
     const gap = new Float32Array(c);
     for (let ci = 0; ci < c; ci++) {
@@ -511,14 +515,283 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
       for (let i = 0; i < area; i++) s += cur[base + i];
       gap[ci] = s / area;
     }
-
-    // FC
     for (let k = 0; k < nClasses; k++) {
       let s = headB[k];
       const base = k * c;
       for (let i = 0; i < c; i++) s += headW[base + i] * gap[i];
       logits[k] = s;
     }
+  }
+
+  /* ───────── 反向传播（只为「解释」服务，不进热路径） ───────── */
+
+  type Act = {
+    inA: Float32Array; inC: number; inH: number; inW: number;
+    outA: Float32Array; outC: number; outH: number; outW: number;
+    poolA: Float32Array | null; poolH: number; poolW: number;
+  };
+
+  /**
+   * 各层激活的常驻缓存 + 三块梯度缓冲。
+   *
+   * 为什么不在每次 explain 时新分配：一次激活总共约 15 万个 float（600 KB），
+   * X-Ray 开着时一秒要跑七八次，每秒造 4 MB 垃圾没必要——形状是固定的，
+   * 分配一次反复用。
+   */
+  let actCache: Act[] | null = null;
+  let gBufs: Float32Array[] | null = null;
+  const explainLogits = new Float32Array(nClasses);
+
+  function buildCache(): void {
+    const acts: Act[] = [];
+    let c = 1;
+    let h = 32;
+    let wd = 32;
+    for (const l of layers) {
+      const act: Act = {
+        inA: new Float32Array(c * h * wd),
+        inC: c,
+        inH: h,
+        inW: wd,
+        outA: new Float32Array(l.cout * h * wd),
+        outC: l.cout,
+        outH: h,
+        outW: wd,
+        poolA: null,
+        poolH: 0,
+        poolW: 0,
+      };
+      if (l.pool) {
+        act.poolH = h >> 1;
+        act.poolW = wd >> 1;
+        act.poolA = new Float32Array(l.cout * act.poolH * act.poolW);
+      }
+      acts.push(act);
+      c = l.cout;
+      if (l.pool) {
+        h >>= 1;
+        wd >>= 1;
+      }
+    }
+    actCache = acts;
+    gBufs = [new Float32Array(maxCells), new Float32Array(maxCells), new Float32Array(maxCells)];
+  }
+
+  /** forward 并把每层的输入/输出留在缓存里 */
+  function forwardCached(x0: Float32Array): void {
+    if (!actCache || !gBufs) buildCache();
+    const acts = actCache!;
+    let cur = x0;
+    for (let bi = 0; bi < layers.length; bi++) {
+      const layer = layers[bi];
+      const a = acts[bi];
+      a.inA.set(cur.subarray(0, a.inC * a.inH * a.inW));
+      if (layer.type === 0) conv3x3(a.inA, layer, a.inH, a.inW, a.outA);
+      else if (layer.type === 1) conv3x3dw(a.inA, layer, a.inH, a.inW, a.outA);
+      else conv1x1(a.inA, layer, a.inH * a.inW, a.outA);
+      if (a.poolA) {
+        maxpool2(a.outA, a.outC, a.outH, a.outW, a.poolA);
+        cur = a.poolA;
+      } else {
+        cur = a.outA;
+      }
+    }
+    const last = acts[acts.length - 1];
+    const area = last.poolA ? last.poolH * last.poolW : last.outH * last.outW;
+    const src = last.poolA ?? last.outA;
+    const gap = new Float32Array(last.outC);
+    for (let ci = 0; ci < last.outC; ci++) {
+      let s = 0;
+      const base = ci * area;
+      for (let i = 0; i < area; i++) s += src[base + i];
+      gap[ci] = s / area;
+    }
+    for (let k = 0; k < nClasses; k++) {
+      let s = headB[k];
+      const base = k * last.outC;
+      for (let i = 0; i < last.outC; i++) s += headW[base + i] * gap[i];
+      explainLogits[k] = s;
+    }
+  }
+
+  /**
+   * ∂logit[cls] / ∂x，x 是归一化（0..1）的输入。
+   *
+   * 手写反向传播，四种算子各一条：
+   *   pointwise  → dIn[ci] += w[co][ci] * dOut[co]
+   *   depthwise  → 同一组 3x3 做「转置卷积」（把 conv 的下标反过来累加）
+   *   dense3x3   → 同上，但要在 cin 维度上求和
+   *   maxpool    → 梯度只会流到前向取到最大值的那一格，其余三格是 0
+   * ReLU 的梯度就是「前向输出 > 0 ? 1 : 0」，靠缓存下来的前向输出当掩码。
+   *
+   * 全是标量循环、没有矩阵库：一次 32x32 → 148 类，约是 forward 的两倍开销。
+   */
+  function gradInput(img: Uint8Array, size: number, classIndex: number): Float32Array | null {
+    if (size !== 32) return null;
+    if (classIndex < 0 || classIndex >= nClasses) return null;
+    if (!actCache || !gBufs) buildCache();
+    const acts = actCache!;
+    const bufs = gBufs!;
+
+    // 归一化输入单独占一块（forwardCached 内部会读它）
+    const x0 = new Float32Array(size * size);
+    for (let i = 0; i < x0.length; i++) x0[i] = img[i] / 255;
+    forwardCached(x0);
+
+    const last = acts[acts.length - 1];
+    const areaLast = last.poolA ? last.poolH * last.poolW : last.outH * last.outW;
+    // dlogit/dgap = headW[cls]，dgap/dA = 1/area
+    let curG = bufs[0];
+    let curCells = last.outC * areaLast;
+    for (let ci = 0; ci < last.outC; ci++) {
+      const g = headW[classIndex * last.outC + ci] / areaLast;
+      curG.fill(g, ci * areaLast, (ci + 1) * areaLast);
+    }
+
+    let bi2 = 0;
+    for (let bi = layers.length - 1; bi >= 0; bi--) {
+      const layer = layers[bi];
+      const a = acts[bi];
+      const outCells = a.outC * a.outH * a.outW;
+
+      // ── 1. 反池化：把池化网格上的梯度送回前向取到最大值的那一格 ──
+      let preG = bufs[1];
+      if (a.poolA) {
+        preG.fill(0, 0, outCells);
+        const ow = a.poolW;
+        const ih = a.outH;
+        const iw = a.outW;
+        for (let ci = 0; ci < a.outC; ci++) {
+          const inBase = ci * ih * iw;
+          const pBase = ci * ow * a.poolH;
+          for (let y = 0; y < a.poolH; y++) {
+            for (let x = 0; x < ow; x++) {
+              const g = curG[pBase + y * ow + x];
+              if (g === 0) continue;
+              const r0 = inBase + (y * 2) * iw;
+              const r1 = r0 + iw;
+              const i00 = r0 + x * 2;
+              const i01 = i00 + 1;
+              const i10 = r1 + x * 2;
+              const i11 = i10 + 1;
+              const o = a.outA;
+              let best = i00;
+              if (o[i01] > o[best]) best = i01;
+              if (o[i10] > o[best]) best = i10;
+              if (o[i11] > o[best]) best = i11;
+              preG[best] += g;
+            }
+          }
+        }
+      } else {
+        preG.set(curG.subarray(0, outCells));
+      }
+
+      // ── 2. ReLU 掩码 ──
+      for (let i = 0; i < outCells; i++) {
+        if (a.outA[i] <= 0) preG[i] = 0;
+      }
+
+      // ── 3. 转置卷积：把 out 上的梯度累加回 in ──
+      let inG = bufs[2];
+      const inCells = a.inC * a.inH * a.inW;
+      inG.fill(0, 0, inCells);
+      const ih = a.inH;
+      const iw = a.inW;
+      const oh = a.outH;
+      const ow2 = a.outW;
+
+      if (layer.type === 2) {
+        // pointwise：dIn[ci][i] += Σ_co w[co][ci] * dOut[co][i]
+        for (let co = 0; co < layer.cout; co++) {
+          const oBase = co * oh * ow2;
+          const wBase = co * layer.cin;
+          for (let ci = 0; ci < layer.cin; ci++) {
+            const q = layer.w[wBase + ci];
+            if (q === 0) continue;
+            const iBase = ci * oh * ow2;
+            for (let i = 0; i < oh * ow2; i++) inG[iBase + i] += q * preG[oBase + i];
+          }
+        }
+      } else if (layer.type === 1) {
+        // depthwise：每通道自己和自己卷积，转置时同样只在本通道内搬
+        for (let ci = 0; ci < layer.cin; ci++) {
+          const base = ci * oh * ow2;
+          const kw = ci * 9;
+          for (let y = 0; y < oh; y++) {
+            const r = base + y * ow2;
+            for (let x = 0; x < ow2; x++) {
+              const g = preG[r + x];
+              if (g === 0) continue;
+              for (let ky = 0; ky < 3; ky++) {
+                const sy = y + ky - 1;
+                if (sy < 0 || sy >= ih) continue;
+                for (let kx = 0; kx < 3; kx++) {
+                  const sx = x + kx - 1;
+                  if (sx < 0 || sx >= iw) continue;
+                  inG[base + sy * iw + sx] += layer.w[kw + ky * 3 + kx] * g;
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // dense 3x3
+        for (let co = 0; co < layer.cout; co++) {
+          const oBase = co * oh * ow2;
+          for (let ci = 0; ci < layer.cin; ci++) {
+            const kw = (co * layer.cin + ci) * 9;
+            const iBase = ci * ih * iw;
+            for (let y = 0; y < oh; y++) {
+              const r = oBase + y * ow2;
+              for (let x = 0; x < ow2; x++) {
+                const g = preG[r + x];
+                if (g === 0) continue;
+                for (let ky = 0; ky < 3; ky++) {
+                  const sy = y + ky - 1;
+                  if (sy < 0 || sy >= ih) continue;
+                  for (let kx = 0; kx < 3; kx++) {
+                    const sx = x + kx - 1;
+                    if (sx < 0 || sx >= iw) continue;
+                    inG[iBase + sy * iw + sx] += layer.w[kw + ky * 3 + kx] * g;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 轮换缓冲：这一层的输入梯度就是上一层的输出梯度
+      const tmp = curG;
+      curG = inG;
+      curCells = inCells;
+      bufs[0] = curG;
+      bufs[2] = tmp;
+      bufs[1] = preG;
+      bi2++;
+    }
+    void bi2;
+    void curCells;
+
+    // 现在 curG 是 ∂logit/∂(归一化输入)，长度 32*32
+    const out = new Float32Array(size * size);
+    out.set(curG.subarray(0, out.length));
+    return out;
+  }
+
+  function predict(img: Uint8Array, size: number): Float32Array {
+    if (size !== 32) throw new Error(`输入尺寸必须是 32，收到 ${size}`);
+    const total = size * size;
+    for (let i = 0; i < total; i++) bufA[i] = img[i] / 255;
+    const logits = new Float32Array(nClasses);
+    runForward(bufA, size, logits);
+    return logits;
+  }
+
+  function forwardNormalized(x: Float32Array, size: number): Float32Array {
+    const logits = new Float32Array(nClasses);
+    runForward(x, size, logits);
     return logits;
   }
 
@@ -541,7 +814,16 @@ export function parseModel(bytes: Uint8Array, classes: ModelClass[]): DoodleMode
     classes,
     predict,
     topK: (img, size, k) => softmaxTopK(predict(img, size), k),
-  };
+    gradInput,
+    forwardNormalized,
+    // 仅调试用：确认带缓存的 forward 与热路径 forward 逐位一致
+    __debugCachedLogits: (img: Uint8Array) => {
+      const x = new Float32Array(1024);
+      for (let i = 0; i < 1024; i++) x[i] = img[i] / 255;
+      forwardCached(x);
+      return explainLogits;
+    },
+  } as DoodleModel & { __debugCachedLogits: (img: Uint8Array) => Float32Array };
 }
 
 /** 从打包进来的 JSON（含 base64 权重）加载模型 */

@@ -71,7 +71,23 @@
 
 ---
 
-## 它有多小
+## 它不只是猜——你还能反过来看它
+
+**X 光：它在看你画的哪一块。** 点一下候选栏右边的「X 光」，画布上会浮出一层热区——那是
+`∂logit/∂像素`，也就是"这一格像素变亮一点，它的结论会变多少"。手写的反向传播，四种算子
+（dense / depthwise / pointwise / maxpool）的转置全部自己写，和 PyTorch autograd 逐元素
+对上（cos = 1.000000，最大偏差 2e-6）。一次 20 ms，内部节流到 180 ms，叠在画上是这样：
+
+<img src="docs/shots/xray.png" width="300" alt="X-Ray">
+
+**它把哪些词搞混。** 每类留 24 张样本跑一遍，看它平均猜成什么，把最容易混的三条连成线，
+再用力导向布局摆开。于是「画猫被认成老虎」不再是玄学——它们在图上就是同一簇：
+
+<img src="docs/shots/classmap.png" width="300" alt="混淆图">
+
+这两张图都不是设计稿：热力图来自真的梯度，连线来自真的误判。
+
+---
 
 | | |
 |---|---|
@@ -98,7 +114,7 @@ Windows / Linux 上都能开发，真机热重载。出 ipa 靠 GitHub Actions�
 
 ```bash
 npx tsc --noEmit && npx eslint src   # 类型 + lint
-npm run check                        # 三道闸门：栅格化 / 推理一致率 / 玩法状态机
+npm run check                        # 四道闸门：栅格化 / 推理一致率 / 反向传播 / 玩法状态机
 ```
 
 训练（需要 PyTorch + QuickDraw 原始笔画）：
