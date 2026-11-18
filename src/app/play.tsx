@@ -340,8 +340,10 @@ export default function PlayScreen() {
       session.start(now);
       const r = session.feed(res.probs, now, res.ink);
       pushSnap(session.snapshot(now));
-      // X-Ray：解释它自己的结论（top-1），不是解释"为什么不是目标词"
-      if (xrayRef.current) {
+      // X-Ray：解释它自己的结论（top-1），不是解释"为什么不是目标词"。
+      // 只在抬手那一帧算：一次反向传播在真机上是 40~60ms，跟着手指每 180ms 跑一次
+      // 会让人感到"笔跟不上手"。热力图一秒变几次毫无意义，一笔一更新正好。
+      if (force && xrayRef.current) {
         let top = 0;
         for (let i = 1; i < res.probs.length; i++) if (res.probs[i] > res.probs[top]) top = i;
         const h = heat(top);
