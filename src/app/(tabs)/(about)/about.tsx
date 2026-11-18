@@ -112,6 +112,7 @@ export default function AboutScreen() {
           { label: '量化', value: '权重 per-channel int8，激活 float32' },
           { label: '推理', value: `${ms > 0 ? ms : '—'} ms（本机实测）` },
           { label: '唤醒', value: `${loadMs} ms` },
+          { label: 'X 光', value: '手写反向传播，与 autograd 逐元素一致' },
           { label: '网络权限', value: '无。App 里没有一行网络代码' },
         ]} />
       </View>
